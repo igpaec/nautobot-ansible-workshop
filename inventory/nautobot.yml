@@ -7,7 +7,7 @@
 # any other extension is rejected outright. Which excludes every modern
 # plugin-based inventory, since they are all .yml.
 #   The exec bit is the least invasive way through: no rename, no restructure, and
-# git preserves the mode. Verified working in the POC.
+# git preserves the mode. Verified working.
 #   chmod +x inventory/nautobot.yml
 #   git update-index --chmod=+x inventory/nautobot.yml
 #   For the workshop itself, don't rely on this at all — pre-create both AWX

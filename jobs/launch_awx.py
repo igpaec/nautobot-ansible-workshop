@@ -68,7 +68,7 @@ import requests
 from nautobot.apps.jobs import JobButtonReceiver, register_jobs
 
 # Groups these jobs together in the Nautobot Jobs list.
-name = "AC6 Workshop"
+name = "Nautobot Ansible Workshop"
 
 DEFAULT_TIMEOUT = 15
 

@@ -1,21 +1,21 @@
-# awx/awx-poc.yml
+# awx/awx.yml
 #
 # Every image is pinned to an exact tag or digest. Verified 2026-08-25 against
 # the awx-operator 2.19.1 CRD and the upstream registries.
 #
-#   kubectl apply -f awx/awx-poc.yml
+#   kubectl apply -f awx/awx.yml
 #
 apiVersion: awx.ansible.com/v1beta1
 kind: AWX
 metadata:
-  name: awx-poc
+  name: awx
   namespace: awx
 spec:
   service_type: nodeport
 
   # Static credentials, identical for every attendee.
   # Create the secret first:
-  #   kubectl -n awx create secret generic awx-admin-password --from-literal=password=AnsibleAC6
+  #   kubectl -n awx create secret generic awx-admin-password --from-literal=password=admin
   admin_user: admin
   admin_password_secret: awx-admin-password
 

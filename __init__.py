@@ -1,4 +1,4 @@
-"""Package marker for the AC6 workshop lab repository.
+"""Package marker for the workshop lab repository.
 
 This file is REQUIRED and must not be deleted.
 
@@ -7,10 +7,10 @@ Nautobot loads Jobs from a Git repository by walking the repository with
 `import_modules_privately`). `walk_packages` only descends into a directory
 that is an importable package -- i.e. one containing an `__init__.py`.
 
-Without this file, Nautobot never imports `ac6_poc.jobs`, `registry["jobs"]`
+Without this file, Nautobot never imports `nautobot_ansible_workshop.jobs`, `registry["jobs"]`
 stays empty, and the repository sync finishes SUCCESS while logging:
 
-    No jobs were registered on loading the `ac6_poc.jobs` submodule.
+    No jobs were registered on loading the `nautobot_ansible_workshop.jobs` submodule.
     Did you miss a `register_jobs()` call? ...
 
 which is misleading -- `register_jobs()` is fine; the package was never

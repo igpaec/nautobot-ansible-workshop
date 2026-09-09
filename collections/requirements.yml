@@ -16,7 +16,7 @@
 # These were `>=` floors until the first execution environment was built, at
 # which point the problem became obvious: two builds on different days would
 # resolve different collection versions from identical inputs, producing two
-# different images that both claim to be ac6-ee:1.0.0. That is the same class
+# different images that both claim to be workshop-ee:1.0.0. That is the same class
 # of failure as an unpinned container tag, one layer down — and this file is
 # read by BOTH the EE build and AWX's project sync, so a drift here shows up in
 # two places at once.
@@ -26,7 +26,7 @@
 # aspirational, and they are known to resolve together.
 #
 # To re-measure after a deliberate bump:
-#   docker run --rm -e HOME=/tmp --entrypoint ansible-galaxy ac6-ee:1.0.0 collection list
+#   docker run --rm -e HOME=/tmp --entrypoint ansible-galaxy workshop-ee:1.0.0 collection list
 
 collections:
   - name: arista.eos

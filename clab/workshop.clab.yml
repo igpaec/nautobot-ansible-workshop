@@ -6,8 +6,8 @@
 #   docker image inspect ceos:4.34.2F --format '{{.Architecture}}/{{.Os}}'
 #
 # Deploy:
-#   sudo containerlab deploy -t clab/poc.clab.yml
-#   sudo containerlab inspect -t clab/poc.clab.yml
+#   sudo containerlab deploy -t clab/workshop.clab.yml
+#   sudo containerlab inspect -t clab/workshop.clab.yml
 #
 # The management IPs below are PINNED and every lab prints them as literals.
 # Do not let the runtime allocate: without `mgmt-ipv4` containerlab hands out
@@ -18,10 +18,10 @@
 # x86_64 and needs the non-ARM image at the SAME version (4.34.2F) so findings
 # transfer. The image tag is identical either way.
 
-name: ac6-poc
+name: workshop
 
 mgmt:
-  network: clab-ac6-poc
+  network: clab-workshop
   ipv4-subnet: 172.20.20.0/24
 
 topology:

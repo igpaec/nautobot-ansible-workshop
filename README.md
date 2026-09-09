@@ -1,6 +1,6 @@
-# ac6-poc — Stage 0: the disconnected baseline
+# nautobot-ansible-workshop — Stage 0: the disconnected baseline
 
-POC repo for the AutoCon 6 workshop *From Intent to Execution: Nautobot and Ansible, Better Together*.
+The lab repository for the workshop *From Intent to Execution: Nautobot and Ansible, Better Together*.
 
 **This is deliberately the "wrong" version.** A static inventory, `group_vars`, and a six-field survey — a setup that works and is obviously disconnected from the network's source of truth. Later stages dismantle it piece by piece:
 
@@ -16,10 +16,10 @@ POC repo for the AutoCon 6 workshop *From Intent to Execution: Nautobot and Ansi
 ## Layout
 
 ```
-ac6-poc/
+nautobot-ansible-workshop/
 ├── ansible.cfg
 ├── clab/
-│   └── poc.clab.yml              # 2 × Arista cEOS
+│   └── workshop.clab.yml              # 2 × Arista cEOS
 ├── collections/
 │   └── requirements.yml
 ├── inventory/
@@ -40,8 +40,8 @@ ac6-poc/
 
 ```bash
 docker import cEOSarm-lab-4.34.2F.tar.xz ceos:4.34.2F
-sudo containerlab deploy -t clab/poc.clab.yml
-sudo containerlab inspect -t clab/poc.clab.yml
+sudo containerlab deploy -t clab/workshop.clab.yml
+sudo containerlab inspect -t clab/workshop.clab.yml
 ```
 
 Update `ansible_host` in `inventory/static.ini` to match the reported IPs.
@@ -62,14 +62,14 @@ Drop `--check` once the diff looks right.
 
 > ⚠️ **Verify cEOS credentials.** ContainerLab cEOS nodes commonly come up `admin`/`admin`, but it varies by version and injected startup config. Confirm with `ssh admin@<node-ip>` before blaming Ansible.
 
-> ### ⚠️ Seen once, cause unresolved: "Too many authentication failures"
->
+### ⚠️ Seen once, cause unresolved: "Too many authentication failures"
+
 > ```
 > Failed to authenticate public key: Received SSH_MSG_DISCONNECT:
 > 2:Too many authentication failures
 > ```
 >
-> Hit once during the POC; **went away on a retry after the password was re-entered**, so the real cause was never isolated. Two candidates, both plausible:
+> Hit once while building this; **went away on a retry after the password was re-entered**, so the real cause was never isolated. Two candidates, both plausible:
 >
 > 1. **A mistyped password.** Failed password attempts also count against
 > `MaxAuthTries`, and can surface as "too many authentication failures."
@@ -97,7 +97,7 @@ Drop `--check` once the diff looks right.
 
 ```bash
 git init && git add . && git commit -m "Stage 0: disconnected baseline"
-gh repo create ac6-poc --public --source=. --push
+gh repo create nautobot-ansible-workshop --public --source=. --push
 ```
 
 Then in AWX, in this order: **Project** → **Inventory** → **Inventory Source** (*Sourced from a Project*, file `inventory/static.ini`) → **Machine Credential** → **Job Template** (playbook `playbooks/configure_base.yml`) → **Survey**.
@@ -128,6 +128,6 @@ The playbook maps the flat survey answers onto the list-shaped template variable
 kubectl -n awx run nettest --rm -it --restart=Never --image=busybox -- ping -c3 172.20.20.11
 ```
 
-## POC shortcuts — do NOT carry into the lab
+## Lab shortcuts — do NOT carry into production
 
 Single shared admin token · HTTP not HTTPS · no RBAC · no TLS on webhooks · `host_key_checking = False` · secrets in plain extra_vars where the workshop will use Nautobot Secrets Groups.

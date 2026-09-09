@@ -14,7 +14,7 @@
 #
 # 🔴 NAUTOBOT_URL / NAUTOBOT_TOKEN ARE OPTIONAL OVERRIDES, NOT REQUIREMENTS.
 # Both values are deterministic — every stack is http://localhost:8080 with the
-# pinned literal token from proctor/00-credentials-and-addressing.md. Requiring
+# pinned literal token from nautobot-ansible-workshop-instructor/00-credentials-and-addressing.md. Requiring
 # them as env vars made the playbook depend on shell state that does not survive
 # a new SSH session, `sudo -i`, or any non-interactive shell that skips .bashrc.
 # See the same note at the top of seed_awx.yml.
@@ -26,7 +26,7 @@
 #   LocationType → Location → Manufacturer → Platform → DeviceType → Role
 #   → Device → Interface → Prefix → IPAddress → bind IP → set primary_ip4
 
-- name: Seed Nautobot with the POC topology
+- name: Seed Nautobot with the workshop topology
   hosts: localhost
   connection: local
   gather_facts: false
@@ -48,21 +48,38 @@
 
     # Nautobot clones this itself to discover the Jobs in jobs/ — so it must be
     # a URL Nautobot's worker can reach, not a local path.
-    lab_repo_url: https://github.com/igpaec/ac6-poc.git
+    lab_repo_url: https://github.com/igpaec/nautobot-ansible-workshop.git
     lab_repo_branch: main
 
-    # These MUST match clab/poc.clab.yml's pinned mgmt-ipv4 values, and the
+    # These MUST match clab/workshop.clab.yml's pinned mgmt-ipv4 values, and the
     # literals printed in the attendee labs. Lab 1's dynamic inventory builds
     # ansible_host from primary_ip4, so a mismatch here sends every playbook to
     # the wrong address — with no error that says so.
     #
     # Corrected 2026-08-26: these were .3 and .2, copied from an unpinned
     # ContainerLab run where the nodes came up in reverse order.
-    poc_devices:
+    #
+    # 🔴 `status` IS PER DEVICE, AND leaf2 MUST NOT START Active.
+    #
+    # Found 2026-09-04 while building reset.sh. Both devices used to be seeded
+    # `Active`, which makes **Lab 4 impossible on a clean stack**: step 4d tells
+    # the attendee to set leaf2's status to Active, and if it is already Active
+    # that edit changes nothing — no ObjectChange, no webhook, no workflow. The
+    # lab appears to do nothing at all, with no error anywhere.
+    #
+    # It went unnoticed because the first Lab 4 run happened on a stack where
+    # leaf2 had already been flipped by hand during debugging.
+    #
+    # `Planned` is also better content, not a workaround: leaf2 is the site
+    # being turned up, and "planned but not yet live" is exactly what the
+    # workflow is called `Site Turnup (gated)` for.
+    workshop_devices:
       - name: leaf1
+        status: Active
         mgmt_ip: 172.20.20.11/24
         eth1_description: to leaf2 Ethernet1
       - name: leaf2
+        status: Planned
         mgmt_ip: 172.20.20.12/24
         eth1_description: to leaf1 Ethernet1
 
@@ -127,6 +144,7 @@
       register: nb_ping
       failed_when: false
       changed_when: false
+      tags: [reset]
 
     - name: Explain it if Nautobot is not answering
       ansible.builtin.assert:
@@ -134,11 +152,12 @@
         fail_msg: >-
           Nautobot at {{ nb.url }} returned {{ nb_ping.status }}.
           401/403 means the API token is wrong — check it against
-          proctor/00-credentials-and-addressing.md, or export NAUTOBOT_TOKEN to
+          nautobot-ansible-workshop-instructor/00-credentials-and-addressing.md, or export NAUTOBOT_TOKEN to
           override. Anything else (-1, 000, 502) means Nautobot is not up:
           `cd ~/nautobot-docker-compose && docker compose ps` and give it a
           minute if it is still migrating.
         success_msg: "Nautobot answering at {{ nb.url }}"
+      tags: [reset]
 
     # ----------------------------------------------- custom fields (Stage 3)
     # Schema setup, so it belongs here rather than in the write-back playbook.
@@ -234,11 +253,12 @@
         role: leaf
         platform: Arista EOS
         location: "{{ site_name }}"
-        status: Active
+        status: "{{ item.status }}"
         state: present
-      loop: "{{ poc_devices }}"
+      loop: "{{ workshop_devices }}"
       loop_control:
         label: "{{ item.name }}"
+      tags: [reset]
 
     # -------------------------------------------------------------------- IPAM
     # IPAM comes BEFORE the interfaces, because the interface task binds the
@@ -260,7 +280,7 @@
         namespace: Global
         status: Active
         state: present
-      loop: "{{ poc_devices }}"
+      loop: "{{ workshop_devices }}"
       loop_control:
         label: "{{ item.mgmt_ip }}"
 
@@ -311,7 +331,7 @@
           objects:
             - ip_address: "{{ item.mgmt_ip }}"
         state: present
-      loop: "{{ poc_devices }}"
+      loop: "{{ workshop_devices }}"
       loop_control:
         label: "{{ item.name }}"
 
@@ -333,7 +353,7 @@
         status: Active
         description: "{{ item.eth1_description }}"
         state: present
-      loop: "{{ poc_devices }}"
+      loop: "{{ workshop_devices }}"
       loop_control:
         label: "{{ item.name }}"
 
@@ -346,7 +366,7 @@
         name: "{{ item.name }}"
         primary_ip4: "{{ item.mgmt_ip }}"
         state: present
-      loop: "{{ poc_devices }}"
+      loop: "{{ workshop_devices }}"
       loop_control:
         label: "{{ item.name }}"
 
@@ -372,6 +392,7 @@
           location:
             - "{{ site_name }}"
         state: present
+      tags: [reset]
 
     # ------------------------------------------- Config Context (Lab 2)
     # No collection module exists for Config Contexts or their Schemas in
@@ -394,6 +415,7 @@
           Accept: application/json
         status_code: 200
       register: schema_lookup
+      tags: [reset]
 
     - name: Config Context Schema — leaf-base-schema
       ansible.builtin.uri:
@@ -411,6 +433,7 @@
           data_schema: "{{ leaf_base_schema }}"
         status_code: [200, 201]
       register: schema_result
+      tags: [reset]
 
     - name: Look up the Config Context
       ansible.builtin.uri:
@@ -419,6 +442,7 @@
         headers: *nb_headers
         status_code: 200
       register: context_lookup
+      tags: [reset]
 
     - name: Config Context — leaf-base
       ansible.builtin.uri:
@@ -441,6 +465,7 @@
             - "{{ role_leaf.role.id }}"
           data: "{{ leaf_base_context }}"
         status_code: [200, 201]
+      tags: [reset]
 
     # ------------------------------------------- Secrets Group (Lab 3c)
     # Lab 3c asks attendees to compare Nautobot's way of holding device
@@ -490,7 +515,7 @@
     # GitRepository model: name, remote_url, branch, provided_contents.
     - name: Look up the Git Repository
       ansible.builtin.uri:
-        url: "{{ nb.url }}/api/extras/git-repositories/?name=ac6-poc"
+        url: "{{ nb.url }}/api/extras/git-repositories/?name=nautobot-ansible-workshop"
         method: GET
         headers: *nb_headers
         status_code: 200
@@ -505,7 +530,7 @@
         headers: *nb_headers
         body_format: json
         body:
-          name: ac6-poc
+          name: nautobot-ansible-workshop
           remote_url: "{{ lab_repo_url }}"
           branch: "{{ lab_repo_branch }}"
           provided_contents:

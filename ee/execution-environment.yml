@@ -1,5 +1,5 @@
 ---
-# Custom execution environment for the AC6 workshop.
+# Custom execution environment for the Nautobot + Ansible workshop.
 #
 # 🔴 WHY THIS EXISTS. The stock EE cannot run this workshop's collections.
 #
@@ -28,18 +28,18 @@
 # ------------------------------------------------------------------ BUILDING
 #
 #   /opt/ansible/bin/pip install ansible-builder==3.1.1
-#   cd ~/ac6-poc/ee && /opt/ansible/bin/ansible-builder build --tag ac6-ee:1.0.0 --container-runtime docker
-#   minikube -p awx image load ac6-ee:1.0.0
+#   cd ~/nautobot-ansible-workshop/ee && /opt/ansible/bin/ansible-builder build --tag workshop-ee:1.0.0 --container-runtime docker
+#   minikube -p awx image load workshop-ee:1.0.0
 #
 # Then point AWX at it — `seed_awx.yml` does this, or by hand:
-#   Administration -> Execution Environments -> ac6-ee -> Image: ac6-ee:1.0.0
+#   Administration -> Execution Environments -> workshop-ee -> Image: workshop-ee:1.0.0
 #
 # `minikube image load` is the single-stack answer and needs no registry. For
 # 60 stacks this image has to be mirrored like every other — that is G10 /
 # the image-mirroring gap, deliberately not solved here.
 #
 # ⚠️ Pull policy must NOT be "always" for a locally loaded image — AWX would
-# try to fetch `ac6-ee:1.0.0` from a registry that has never heard of it.
+# try to fetch `workshop-ee:1.0.0` from a registry that has never heard of it.
 # seed_awx.yml sets `pull: missing`.
 
 version: 3

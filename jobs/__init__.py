@@ -1,4 +1,4 @@
-"""Nautobot Jobs for the AC6 workshop POC.
+"""Nautobot Jobs for the Nautobot + Ansible workshop.
 
 Nautobot discovers Jobs from a Git Repository that provides "jobs" by importing
 the top-level `jobs/` package (verified in Nautobot 3.2.2:
@@ -11,10 +11,10 @@ Each module here does its own registration, so importing it is enough.
 TO LOAD THESE INTO NAUTOBOT
 ---------------------------
 Extensibility -> Git Repositories -> Add:
-  Name:                 ac6-poc
+  Name:                 nautobot-ansible-workshop
   Remote URL:           <this repo's HTTPS clone URL>
   Provides:             jobs
-Then Sync. The jobs appear under Jobs, grouped as "AC6 Workshop", and must be
+Then Sync. The jobs appear under Jobs, grouped as "Nautobot Ansible Workshop", and must be
 **enabled** before they can run.
 """
 

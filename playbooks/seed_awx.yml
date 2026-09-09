@@ -16,7 +16,7 @@
 # cost time twice, and it was the wrong design:
 #
 #   * The values are DETERMINISTIC. Every stack is http://localhost:8013 with
-#     admin/AnsibleAC6 — see proctor/00-credentials-and-addressing.md. The
+#     admin/admin — see nautobot-ansible-workshop-instructor/00-credentials-and-addressing.md. The
 #     project's own rule is to hardcode static literals rather than look them
 #     up, and this file already hardcodes the Nautobot API token below.
 #   * Env vars are shell state. They vanish on a new SSH session, a `sudo -i`,
@@ -68,18 +68,18 @@
     # var comes back as "" not undefined.
     awx_url: "{{ lookup('env', 'CONTROLLER_HOST') | default('http://localhost:8013', true) }}"
     awx_username: "{{ lookup('env', 'CONTROLLER_USERNAME') | default('admin', true) }}"
-    awx_password: "{{ lookup('env', 'CONTROLLER_PASSWORD') | default('AnsibleAC6', true) }}"
+    awx_password: "{{ lookup('env', 'CONTROLLER_PASSWORD') | default('admin', true) }}"
 
     org: Default
-    project_name: AC6 POC
-    scm_url: https://github.com/igpaec/ac6-poc.git
+    project_name: Nautobot Ansible Workshop
+    scm_url: https://github.com/igpaec/nautobot-ansible-workshop.git
     scm_branch: main
 
     # Built from ee/execution-environment.yml and loaded into minikube with
     # `minikube -p awx image load`. No registry involved, so the tag must match
     # what was loaded exactly — see 15-single-stack.md § 2b.
-    ee_name: ac6-ee
-    ee_image: "ac6-ee:1.0.0"
+    ee_name: workshop-ee
+    ee_image: "workshop-ee:1.0.0"
 
     # 🔴 The URL AWX EXECUTION PODS use to reach Nautobot — not the one you use.
     # AWX runs in Kubernetes; Nautobot is a plain container on the host. This is
@@ -130,7 +130,7 @@
           No answer from AWX at {{ awx_url }} (got {{ awx_ping.status }}).
           Almost always the port-forward: it is a foreground process and does
           not survive a reboot or an SSH disconnect. Restart it with
-          `nohup kubectl -n awx port-forward --address 0.0.0.0 svc/awx-poc-service 8013:80 > /tmp/awx-port-forward.log 2>&1 &`
+          `nohup kubectl -n awx port-forward --address 0.0.0.0 svc/awx-service 8013:80 > /tmp/awx-port-forward.log 2>&1 &`
           then re-run this playbook.
         success_msg: "AWX {{ awx_ping.json.version | default('?') }} answering at {{ awx_url }}"
 
@@ -199,7 +199,7 @@
     #
     # ⚠️ `pull: missing` IS REQUIRED for a locally built image. The default is
     # already `missing`, but stating it here is deliberate: `always` would make
-    # AWX try to fetch ac6-ee from a registry that has never heard of it, and
+    # AWX try to fetch workshop-ee from a registry that has never heard of it, and
     # the failure is an image-pull error that says nothing about why.
     # AWX will happily register an EE whose image does not exist. The failure
     # then surfaces much later, as ImagePullBackOff on the first job, which
@@ -217,12 +217,12 @@
           {{ ee_image }} is not loaded into the awx minikube profile, so every
           job would fail with ImagePullBackOff. Build and load it:
           `/opt/ansible/bin/pip install ansible-builder==3.1.1` then
-          `cd ~/ac6-poc/ee && /opt/ansible/bin/ansible-builder build --tag {{ ee_image }} --container-runtime docker`
+          `cd ~/nautobot-ansible-workshop/ee && /opt/ansible/bin/ansible-builder build --tag {{ ee_image }} --container-runtime docker`
           then `minikube -p awx image load {{ ee_image }}`.
           See 15-single-stack.md section 2b.
         success_msg: "{{ ee_image }} is present in the awx minikube profile."
 
-    - name: Execution environment — ac6-ee
+    - name: Execution environment — workshop-ee
       awx.awx.execution_environment:
         name: "{{ ee_name }}"
         image: "{{ ee_image }}"
@@ -236,7 +236,7 @@
     # -> global default, so the project is the narrowest place that covers all
     # of this workshop's templates without touching anything else on the
     # instance.
-    - name: Project — AC6 POC
+    - name: Project — Nautobot Ansible Workshop
       awx.awx.project:
         name: "{{ project_name }}"
         organization: "{{ org }}"
@@ -337,7 +337,7 @@
     # catches — that unvalidated typo is what Lab 2's Config Context Schema
     # later prevents. A pre-filled form makes the "before" state look fine.
     #
-    # The values stay printed in attendee/lab0-cold-open.md so nobody has to
+    # The values stay printed in nautobot-ansible-workshop-guide/lab0-cold-open.md so nobody has to
     # hunt for them. They just should not arrive already entered.
     #
     # Do not "helpfully" re-add these.
@@ -614,7 +614,7 @@
     # to revoke and reissue rather than pile up.
     - name: Create the AWX token for Nautobot
       awx.awx.token:
-        description: ac6-workshop
+        description: nautobot-ansible-workshop
         scope: write
         state: present
       register: awx_token
@@ -813,7 +813,7 @@
     - name: Put the AWX connection details where the celery worker will see them
       ansible.builtin.blockinfile:
         path: "{{ lookup('env', 'HOME') }}/nautobot-docker-compose/environments/creds.env"
-        marker: "# {mark} ANSIBLE MANAGED BLOCK — ac6 workshop AWX access"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK — workshop AWX access"
         create: true
         mode: "0600"
         block: |
