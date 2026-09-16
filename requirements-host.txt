@@ -1,0 +1,77 @@
+# Lockfile for the PROCTOR HOST's Python venv at /opt/ansible.
+#
+#   /opt/ansible/bin/pip install -r requirements-host.txt
+#
+# Built by `01-server-prep.md` § 5. Nothing an attendee touches.
+#
+# ---------------------------------------------------------------- WHY IT EXISTS
+#
+# Server prep installs six packages by name:
+#
+#   ansible-core pynautobot awxkit invoke toml paramiko
+#
+# That is a reproducible *intent*, not a reproducible *environment*. The other
+# sixteen below were chosen by pip, and they move:
+#
+#   2026-09-04   cryptography  50.0.0 -> 50.0.1   (10 days, no pin changed)
+#   2026-09-16   urllib3        2.7.0 -> 2.8.0    (12 days, no pin changed)
+#
+# Two measurements, two drifts. Same failure shape as kube-rbac-proxy, one layer
+# down: what we pin stays put, what we do not pin moves quietly. Install from
+# this file and the six-package line becomes a first-bootstrap tool only.
+#
+# --------------------------------------------------------------- WHAT IT IS NOT
+#
+# 🔴 NOT the execution environment's dependency list. The EE names its Python
+#    packages inline in `ee/execution-environment.yml` and takes collections
+#    from `collections/requirements.yml`. The host and the EE resolve their
+#    Python dependencies independently — so `cryptography` can legitimately
+#    differ between a playbook run from the proctor shell and the same playbook
+#    run inside AWX. Nothing has broken on that yet; it is the class of thing
+#    that surfaces once and confusingly.
+#
+# 🔴 NOT named plain `requirements.txt`, deliberately. ansible-builder and a
+#    good deal of AWX-adjacent tooling treat a root `requirements.txt` as the
+#    EE's Python list, and `collections/requirements.yml` already sits beside
+#    it for the EE and the project sync. Two files a directory apart, one for
+#    the host and one for the image, must not be confusable.
+#
+# ------------------------------------------------------------------ RE-MEASURING
+#
+# After any deliberate bump, rebuild the venv from the six-package line and
+# regenerate rather than hand-editing:
+#
+#   /opt/ansible/bin/pip freeze > requirements-host.txt
+#
+# then restore this header. A pin that was not measured is a guess.
+#
+# ⚠️ Measured on BOTH architectures: arm64 (OrbStack, 2026-09-04) and amd64
+# (DigitalOcean, 2026-09-16). 21 of 22 identical; only urllib3 differed, and it
+# ships a single py3-none-any wheel, so that difference is time and not
+# architecture. All four compiled packages — cryptography, cffi, bcrypt,
+# PyNaCl — had prebuilt wheels on each, with no toolchain build.
+#
+# Python 3.12, Ubuntu 24.04 LTS. Last measured 2026-09-16 on amd64.
+
+ansible-core==2.18.19
+awxkit==24.6.1
+bcrypt==5.0.0
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.5.1
+cryptography==50.0.1
+idna==3.19
+invoke==2.2.1
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+packaging==26.3
+paramiko==5.0.0
+pycparser==3.0
+PyNaCl==1.6.2
+pynautobot==3.1.1
+PyYAML==6.0.3
+requests==2.34.2
+resolvelib==1.0.1
+setuptools==84.0.0
+toml==0.10.2
+urllib3==2.8.0

@@ -157,10 +157,20 @@ dependencies:
 # sync time, which removes the Galaxy-credential trap (troubleshooting.md § 6)
 # and stops 60 stacks each hitting galaxy.ansible.com at session open.
 #
-# ⚠️ collections/requirements.yml still uses `>=` floors, so two builds on
-# different days can produce different collection versions. Pin them exactly
-# once a build is known good: `ansible-galaxy collection list` inside the
-# image, then rewrite the floors as `==`. Tracked with F11 (tag the repo).
+# ✅ collections/requirements.yml carries exact `==` pins, measured from a built
+# image rather than chosen. Two builds a week apart (2026-09-02, 2026-09-09)
+# produced identical collection versions and identical image sizes.
+#
+# Re-measure after any deliberate bump and put the answer back in that file:
+#   docker run --rm -e HOME=/tmp --entrypoint ansible-galaxy workshop-ee:1.0.0 collection list
+#
+# ⚠️ The `exclude.all_from_collections` stanza above does NOT remove those
+# collections from the image — they ship inside the awx-ee base and stay there.
+# It excludes their
+# PYTHON REQUIREMENTS from dependency resolution, which is what the build needed:
+# introspect.py scans every baked-in collection, and azure.azcollection pulls in
+# azure-cli-core, which caps paramiko <4 and makes the resolve impossible.
+# A `collection list` against the built image therefore shows all 17. Expected.
 options:
   package_manager_path: /usr/bin/dnf
 
