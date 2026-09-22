@@ -632,7 +632,7 @@
     - name: Next step
       ansible.builtin.debug:
         msg: >-
-          Seeded {{ poc_devices | length }} devices at {{ site_name }},
+          Seeded {{ workshop_devices | length }} devices at {{ site_name }},
           plus Config Context leaf-base (schema-validated) and Dynamic Group
           leaf-devices-dc1. Verify:
           ansible-inventory -i inventory/nautobot.yml --graph
