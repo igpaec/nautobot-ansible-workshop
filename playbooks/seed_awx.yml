@@ -325,22 +325,57 @@
         update_on_launch: true
         state: present
 
+    # 🔴 SYNC IT NOW — do not rely on `update_on_launch`.
+    #
+    # Found 2026-09-24. Creating the source is not the same as populating it:
+    # `update_on_launch` only fires when a job runs against the inventory, so a
+    # freshly provisioned stack shows **Nautobot (Lab 1) with zero hosts** until
+    # somebody launches something or clicks Sync.
+    #
+    # Two reasons that is wrong rather than merely untidy:
+    #
+    #   1. `reset_lab.yml` DOES sync it, with the comment "Lab 1's payoff is
+    #      watching the Nautobot inventory populate ... the lab's first check
+    #      looks broken for a reason that has nothing to do with the attendee".
+    #      So reset restored the stack to a BETTER state than provisioning left
+    #      it in — backwards, and it means a reset silently fixes a defect
+    #      nobody knew was there.
+    #
+    #   2. At 60 stacks the first sync would happen 60 times during the session
+    #      rather than once during provisioning, against one Nautobot each.
+    #      Cheap here, and exactly the sort of thing not to discover on the day.
+    - name: Sync the Nautobot inventory source
+      awx.awx.inventory_source_update:
+        name: nautobot.yml
+        inventory: Nautobot (Lab 1)
+        organization: "{{ org }}"
+        wait: true
+        timeout: 120
+
     # --------------------------------------------------------- job templates
     # Lab 0. The survey is the villain of the cold open: six facts Nautobot
     # already holds, retyped by a human, with no validation and no history.
     #
-    # 🟠 F14 — THE `default:` VALUES BELOW SHOULD BE REMOVED.
+    # 🔴 F14 CLOSED 2026-09-24 — THE SURVEY FIELDS ARE DELIBERATELY EMPTY.
     #
-    # They let an attendee click Launch without typing anything, which deletes
-    # the entire point of the cold open. The lab is meant to make retyping six
-    # known-good facts feel tedious, and to leave room for a typo that nothing
-    # catches — that unvalidated typo is what Lab 2's Config Context Schema
-    # later prevents. A pre-filled form makes the "before" state look fine.
+    # There are no `default:` keys below, and adding any back breaks the lab.
     #
-    # The values stay printed in nautobot-ansible-workshop-guide/lab0-cold-open.md so nobody has to
-    # hunt for them. They just should not arrive already entered.
+    # Pre-filled fields let an attendee click Launch without typing anything,
+    # which deletes the entire point of the cold open. The lab exists to make
+    # retyping six known-good facts feel tedious, and to leave room for a typo
+    # that nothing catches — that unvalidated typo is what Lab 2's Config
+    # Context Schema later prevents. A pre-filled form makes the "before" state
+    # look fine, and the whole four hours argue that it is not.
     #
-    # Do not "helpfully" re-add these.
+    # The values stay printed in the attendee guide
+    # (nautobot-ansible-workshop-guide/lab0-cold-open.md) so nobody has to hunt
+    # for them. They just must not arrive already entered.
+    #
+    # ⚠️ `required: true` is doing the work now. With no default and a required
+    # field, AWX refuses to launch until all six are filled — so the friction is
+    # enforced rather than merely encouraged.
+    #
+    # Do not "helpfully" re-add the defaults.
     - name: Job template — Onboard Site (survey)
       awx.awx.job_template:
         name: Onboard Site (survey)
@@ -360,32 +395,26 @@
             - question_name: Site name
               variable: site_name
               type: text
-              default: DC1
               required: true
             - question_name: Primary NTP server
               variable: ntp_primary
               type: text
-              default: 10.0.0.1
               required: true
             - question_name: Secondary NTP server
               variable: ntp_secondary
               type: text
-              default: 10.0.0.2
               required: true
             - question_name: SNMP community
               variable: snmp_community
               type: text
-              default: public
               required: true
             - question_name: DNS server
               variable: dns_server
               type: text
-              default: 10.0.0.53
               required: true
             - question_name: Syslog host
               variable: syslog_host
               type: text
-              default: 10.0.0.10
               required: true
         state: present
 
