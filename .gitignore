@@ -8,6 +8,13 @@ clab-*/
 collections/ansible_collections/
 rendered/
 
+# ansible-builder writes this next to execution-environment.yml on every build:
+# a generated Containerfile plus copies of the requirements it resolved. It is
+# derived output, it is large, and committing it would put a stale duplicate of
+# collections/requirements.yml in the repo — exactly the drift the single-source
+# rule exists to prevent.
+ee/context/
+
 # Never commit these — the POC uses a shared admin token, which is exactly the
 # shortcut that must NOT survive into the lab
 .env

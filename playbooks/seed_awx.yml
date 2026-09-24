@@ -386,7 +386,6 @@
         credentials:
           - cEOS admin
         become_enabled: true
-        ask_inventory_on_launch: true
         survey_enabled: true
         survey_spec:
           name: ""
@@ -418,8 +417,26 @@
               required: true
         state: present
 
-    # ask_inventory_on_launch above is what makes Lab 1 a dropdown change rather
-    # than an edit — the attendee switches to "Nautobot (Lab 1)" at launch.
+    # 🔴 NO ask_inventory_on_launch. Removed 2026-09-24, and it must not come back.
+    #
+    # It used to be set here, with the note "this is what makes Lab 1 a dropdown
+    # change rather than an edit". That was wrong on two counts.
+    #
+    # 1. IT BREAKS THE LAB. Lab 1e has the attendee **Edit** the template, change
+    #    Inventory to "Nautobot (Lab 1)", and Save. With a launch-time prompt they
+    #    can pick it in the launch dialog instead and never open the template —
+    #    which is the one deliberate act the whole lab is built around.
+    #
+    # 2. IT BREAKS LABS 2-4. A launch-time choice is per-run and not persisted:
+    #    the template still says "Static (Lab 0)" afterwards. Every later lab
+    #    would quietly run against the static inventory, and nothing would say so.
+    #
+    # The Inventory field on the template is the single place that decides, which
+    # is also what reset_lab.yml relies on when it sets the inventory per lab.
+    #
+    # ⚠️ The other ask_* flags below are unrelated and ARE required:
+    # ask_variables_on_launch for the Job Button's and webhook's extra_vars, and
+    # ask_limit_on_launch for the webhook's `limit`. Do not remove those.
 
     # Lab 1c. A survey that is NOT a duplicate of the source of truth: it asks
     # which set to act on, which is a human decision Nautobot cannot make.
