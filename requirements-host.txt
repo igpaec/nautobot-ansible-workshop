@@ -15,10 +15,30 @@
 #
 #   2026-09-04   cryptography  50.0.0 -> 50.0.1   (10 days, no pin changed)
 #   2026-09-16   urllib3        2.7.0 -> 2.8.0    (12 days, no pin changed)
+#   2026-09-22   setuptools    >= 81 BROKE THE awx CLI  <-- the one that bit
 #
-# Two measurements, two drifts. Same failure shape as kube-rbac-proxy, one layer
-# down: what we pin stays put, what we do not pin moves quietly. Install from
-# this file and the six-package line becomes a first-bootstrap tool only.
+# Three measurements, three drifts. Same failure shape as kube-rbac-proxy, one
+# layer down: what we pin stays put, what we do not pin moves quietly. Install
+# from this file and the six-package line becomes a first-bootstrap tool only.
+#
+# 🔴 setuptools IS PINNED BACK ON PURPOSE — 80.10.2, not the current release.
+#
+# setuptools >= 81 no longer ships `pkg_resources`, and awxkit 24.6.1 (July 2024)
+# imports it at the top of its CLI. The whole `awx` command dies before doing
+# anything:
+#
+#   File ".../awxkit/cli/client.py", line 5, in <module>
+#       import pkg_resources
+#   ModuleNotFoundError: No module named 'pkg_resources'
+#
+# The error names neither setuptools nor awxkit, which is what makes it
+# expensive. Nothing else here needs >= 81. Revisit only if awxkit releases a
+# version that has dropped the import — it is paused upstream along with AWX.
+#
+# ⚠️ AND NOTE WHAT THIS MEANS ABOUT LOCKFILES. Before 2026-09-22 this file said
+# setuptools==84.0.0, faithfully recorded from a real machine. It was a correct
+# record of a BROKEN environment: installing from it reproduced the breakage
+# exactly. A lockfile buys reproducibility, not correctness.
 #
 # --------------------------------------------------------------- WHAT IT IS NOT
 #
@@ -72,6 +92,6 @@ pynautobot==3.1.1
 PyYAML==6.0.3
 requests==2.34.2
 resolvelib==1.0.1
-setuptools==84.0.0
+setuptools==80.10.2
 toml==0.10.2
 urllib3==2.8.0
