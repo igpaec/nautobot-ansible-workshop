@@ -235,6 +235,13 @@
     # Registered: the Config Context below scopes itself to this role and needs
     # its UUID. The module returns the object whether it created it or found it
     # already there, so this is safe on a re-run.
+    #   🔴 TAGGED `reset` EVEN THOUGH A RESET NEVER CHANGES A ROLE. It is here
+    # for `role_leaf`, which the Config Context task below needs for its scope.
+    # Without the tag, `reset.sh` skipped this task and died on an undefined
+    # variable — found 2026-09-25, the first time reset.sh was ever run.
+    #   The general trap: a tagged task must not depend on a register from an
+    # untagged one. Adding `tags: [reset]` to a task that reads a variable is
+    # half a fix; whatever produced the variable needs the tag too.
     - name: Role
       networktocode.nautobot.role:
         <<: *nb
@@ -243,6 +250,7 @@
           - dcim.device
         state: present
       register: role_leaf
+      tags: [reset]
 
     # ----------------------------------------------------------------- devices
     - name: Devices
