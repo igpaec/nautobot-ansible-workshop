@@ -103,6 +103,15 @@ rename_variables:
 # A string is not a dict, so a string entry is DROPPED and every device still
 # appears — a silent no-op that looks like a working filter. The plugin's own
 # examples use the mapping form; the code agrees with the examples, not the type.
-#   Corrected 2026-09-25. This block used to show the string form.
+#   ⚠️ AND THE VALUE IS CASE-SENSITIVE: `Active`, not `active`. Nautobot 3.x
+# filters status by the Status object's NAME, and a wrong case is not a silent
+# miss — the API returns
+#     {"status":["Select a valid choice. active is not one of the available choices."]}
+# which makes the whole inventory unparseable. Ansible then falls through to its
+# script, yaml and ini plugins, all of which also fail, so the LAST line printed
+# is "Unable to parse ... as an inventory source" — pointing at the file rather
+# than at the one wrong character. Read the `auto plugin` line, not the last one.
+#   Both corrected 2026-09-25, measured: the block previously showed the string
+# form, and then the lowercase value.
 # device_query_filters:
-#   - status: active
+#   - status: Active
