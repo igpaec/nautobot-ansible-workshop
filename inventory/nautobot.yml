@@ -91,9 +91,18 @@ rename_variables:
     repl: "nautobot_tags"
 
 # ---------------------------------------------------------------------- filters
-#   Restrict to active devices. Commented out pending a format check: the option
-# is declared `elements: str`, so entries are query-string fragments
-# ("status=active"), NOT the `- status: active` mapping form used by some other
-# inventory plugins. Enable once verified against your Nautobot.
-#   device_query_filters:
-#   - "status=active"
+#   Restrict the inventory to Active devices only. Uncomment the two lines below
+# — remove the "# " from each — and nothing else needs changing.
+#   ⚠️ THE MAPPING FORM IS THE CORRECT ONE, and it is not what the option's type
+# suggests. `device_query_filters` is declared `elements: str`, which reads as if
+# entries were query-string fragments ("status=active"). They are not. The
+# plugin's validate_query_parameter() starts:
+#     if not (isinstance(parameter, dict) and len(parameter) == 1):
+#         self.display.warning("Warning query parameters %s not a dict ...")
+#         return None
+# A string is not a dict, so a string entry is DROPPED and every device still
+# appears — a silent no-op that looks like a working filter. The plugin's own
+# examples use the mapping form; the code agrees with the examples, not the type.
+#   Corrected 2026-09-25. This block used to show the string form.
+# device_query_filters:
+#   - status: active
