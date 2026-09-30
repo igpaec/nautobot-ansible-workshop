@@ -1,0 +1,27 @@
+# awx/kustomization.yaml
+#
+#   kubectl apply -k awx/
+#
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - github.com/ansible/awx-operator/config/default?ref=2.19.1
+
+images:
+  # REQUIRED, not cosmetic: upstream's own config/manager/kustomization.yaml
+  # sets `newTag: latest` for the operator image. Without this override the
+  # ?ref=2.19.1 manifests would run whatever :latest currently points at.
+  - name: quay.io/ansible/awx-operator
+    newTag: 2.19.1
+
+  # REQUIRED: 2.19.1 hardcodes gcr.io/kubebuilder/kube-rbac-proxy:v0.15.0 in
+  # config/default/manager_auth_proxy_patch.yaml, and Google emptied that
+  # registry — the manifest 404s and the tag list is empty. Remap to the
+  # upstream home, which still carries v0.15.0.
+  # Without this the operator pod sticks at 1/2 ImagePullBackOff.
+  - name: gcr.io/kubebuilder/kube-rbac-proxy
+    newName: quay.io/brancz/kube-rbac-proxy
+    newTag: v0.15.0
+
+namespace: awx

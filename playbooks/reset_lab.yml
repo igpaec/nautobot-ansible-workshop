@@ -1,0 +1,152 @@
+---
+# Reset the mutable state a lab leaves behind, so an attendee can be dropped at
+# the start of any lab.
+#
+# 🔴 DO NOT RUN THIS DIRECTLY. Use `scripts/reset.sh <lab>` in the instructor
+# guide — it also restores the git working tree, which the labs modify and this
+# playbook cannot see.
+#
+# ------------------------------------------------------------ WHAT IT DOES NOT DO
+#
+# It creates nothing. Provisioning already created every object, and CLAUDE.md's
+# pre-staging rule means the labs only ever *change* what is already there. So
+# "reset to lab N" is a short list of edits to undo — not a rebuild.
+#
+# 🔴 It must never rebuild AWX. Cold start is ~5 minutes; an attendee asking for
+# a reset is already behind.
+#
+# 🔴 And it deliberately does NOT run seed_awx.yml, which would be the obvious
+# shortcut. That playbook mints a fresh OAuth2 token and restarts Nautobot's
+# containers to publish it — one to two minutes, and it invalidates the token
+# the Lab 4 webhook is holding until the webhook is PATCHed again. Both are
+# unacceptable in a reset that has to finish in seconds.
+#
+# ------------------------------------------------------------- THE DIVISION OF WORK
+#
+#   reset.sh          git working tree (group_vars, nautobot.yml, templates,
+#                     jobs/, rendered/) — see the script
+#   seed_nautobot.yml Nautobot objects, via `--tags reset`. Reuses the seed's own
+#                     canonical values rather than keeping a second copy here.
+#   THIS PLAYBOOK     the two things neither of those covers:
+#                       1. write-back state ON the devices (Lab 3 and 4 wrote it)
+#                       2. the AWX Job Template's Inventory field (Lab 1e flipped it)
+#
+# HOW TO RUN (via the script, but for reference):
+#   ansible-playbook playbooks/reset_lab.yml -e lab=2
+#
+# Verified against Nautobot 3.2.3 and AWX 24.6.1.
+
+- name: Reset mutable lab state
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  module_defaults:
+    group/awx.awx.controller:
+      controller_host: "{{ awx_url }}"
+      controller_username: "{{ awx_username }}"
+      controller_password: "{{ awx_password }}"
+      validate_certs: false
+
+  vars:
+    # Same defaults-with-env-override pattern as both seed playbooks — see the
+    # header of seed_awx.yml for why these are literals rather than required
+    # environment variables.
+    nb_url: "{{ lookup('env', 'NAUTOBOT_URL') | default('http://localhost:8080', true) }}"
+    nb_token: "{{ lookup('env', 'NAUTOBOT_TOKEN') | default('0123456789abcdef0123456789abcdef01234567', true) }}"
+    awx_url: "{{ lookup('env', 'CONTROLLER_HOST') | default('http://localhost:8013', true) }}"
+    awx_username: "{{ lookup('env', 'CONTROLLER_USERNAME') | default('admin', true) }}"
+    awx_password: "{{ lookup('env', 'CONTROLLER_PASSWORD') | default('admin', true) }}"
+
+    devices: [leaf1, leaf2]
+
+    # 🔴 THE ONLY THING THAT ACTUALLY VARIES BY LAB.
+    #
+    # Lab 1e is the moment the attendee repoints the job template from the
+    # static inventory to the Nautobot-backed one. Everything before that
+    # expects `Static (Lab 0)`; everything after expects `Nautobot (Lab 1)`.
+    #
+    # Every other object is identical at every level, because provisioning
+    # pre-creates all of them. That is what keeps this playbook short.
+    inventory_for_lab:
+      "0": Static (Lab 0)
+      "1": Static (Lab 0)
+      "2": Nautobot (Lab 1)
+      "3": Nautobot (Lab 1)
+      "4": Nautobot (Lab 1)
+
+  tasks:
+    - name: Refuse an unknown lab number
+      ansible.builtin.assert:
+        that: lab | default('') | string in inventory_for_lab
+        fail_msg: >-
+          Pass a lab number: -e lab=0 through -e lab=4. Got
+          '{{ lab | default("nothing") }}'.
+        success_msg: "Resetting to the start of lab {{ lab }}."
+
+    # -------------------------------------------------- Nautobot: write-back state
+    # Labs 3d and 4 write discovered state onto the devices. The seed does not
+    # clear it — `networktocode.nautobot.device` only enforces the fields it is
+    # given — so an attendee reset to Lab 3 would find the serial and the job ID
+    # already populated and the whole beat pre-spoiled.
+    #
+    # `serial: ""` rather than null: the model uses a blank CharField, and null
+    # is rejected.
+    - name: Clear the state Lab 3 and Lab 4 wrote back
+      ansible.builtin.uri:
+        url: "{{ nb_url }}/api/dcim/devices/?name={{ item }}"
+        method: GET
+        headers: &nb_headers
+          Authorization: "Token {{ nb_token }}"
+          Accept: application/json
+          Content-Type: application/json
+        status_code: 200
+      register: dev_lookup
+      loop: "{{ devices }}"
+      changed_when: false
+
+    - name: Blank serial, software version and the custom fields
+      ansible.builtin.uri:
+        url: "{{ nb_url }}/api/dcim/devices/{{ (item.json.results | first).id }}/"
+        method: PATCH
+        headers: *nb_headers
+        body_format: json
+        body:
+          serial: ""
+          software_version: null
+          custom_fields:
+            awx_job_id: null
+            lldp_neighbors: {}
+        status_code: 200
+      loop: "{{ dev_lookup.results }}"
+      loop_control:
+        label: "{{ (item.json.results | first).name }}"
+      when: (item.json.results | default([])) | length == 1
+
+    # ------------------------------------------------------ AWX: the inventory flip
+    - name: Point the survey job template at the inventory this lab expects
+      awx.awx.job_template:
+        name: Onboard Site (survey)
+        organization: Default
+        inventory: "{{ inventory_for_lab[lab | string] }}"
+        state: present
+
+    # Lab 1's payoff is watching the Nautobot inventory populate. If a previous
+    # attempt left the source unsynced the hosts are stale, and the lab's first
+    # check looks broken for a reason that has nothing to do with the attendee.
+    - name: Re-sync the Nautobot inventory source
+      awx.awx.inventory_source_update:
+        name: nautobot.yml
+        inventory: Nautobot (Lab 1)
+        organization: Default
+        wait: true
+        timeout: 120
+      when: (lab | int) >= 1
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "Reset to the start of lab {{ lab }}."
+          - "Job template inventory: {{ inventory_for_lab[lab | string] }}"
+          - "Write-back state cleared on: {{ devices | join(', ') }}"
+          - "⚠️ Device CONFIG is untouched — see reset.sh --devices if lab 2's diff needs to show drift."

@@ -1,0 +1,80 @@
+---
+# Stage 2c — diff Nautobot's intent against what is actually on the device.
+#   THE BEAT: intent lives in Nautobot; the diff is against reality. Nothing is
+# changed unless you explicitly ask.
+#   Self-contained: fetches intent via GraphQL, renders the same template used in
+# Stage 2b, and compares it to the running config. No dependency on having run
+# render_intent.yml first.
+#   HOW TO RUN — check mode is the DEFAULT, so this is safe:
+#   export NAUTOBOT_URL="http://localhost:8080"
+#   export NAUTOBOT_TOKEN="<token>"
+#   ansible-playbook -i inventory/nautobot.yml playbooks/diff_intent.yml -u admin -k --diff
+#   To actually apply what the diff showed:
+#   ... -u admin -k --diff -e apply=true
+#   NOTE: unlike Stage 2b, this one DOES need the devices reachable — it reads the
+# running config over network_cli.
+#   WHY NOT diff_against: intended?
+#   `diff_against: intended` compares the device's ENTIRE running config against
+#   a complete intended config. templates/full_config.j2 is a PARTIAL config
+#   (hostname, NTP, DNS, SNMP, syslog, interfaces), so that mode would report
+#   every unrelated line on the box as a difference. The default
+#   `diff_against: running` does a line-based comparison of just the lines we
+#   supply, which is the "what commands would this send" view we want.
+
+- name: Diff Nautobot intent against the running device config
+  hosts: all
+  gather_facts: false
+
+  vars:
+    # Default to check mode. Override with -e apply=true to push for real.
+    apply: false
+
+  tasks:
+    - name: Fetch the device's intent from Nautobot
+      networktocode.nautobot.graphql_info:
+        url: "{{ lookup('env', 'NAUTOBOT_URL') }}"
+        token: "{{ lookup('env', 'NAUTOBOT_TOKEN') }}"
+        query: "{{ lookup('file', playbook_dir + '/../graphql/device_intent.gql') }}"
+        graph_variables:
+          device_name: ["{{ inventory_hostname }}"]
+        validate_certs: false
+      register: intent
+      delegate_to: localhost
+
+    - name: Sanity check the response
+      ansible.builtin.assert:
+        that:
+          - intent.data.devices is defined
+          - intent.data.devices | length == 1
+        fail_msg: >-
+          Expected exactly one device for '{{ inventory_hostname }}'. Run
+          playbooks/render_intent.yml with -e show_raw=true to inspect.
+
+    - name: Compare intent against the running config
+      # src is rendered as Jinja2 by the module, so `device` below is in scope.
+      # check_mode is computed: safe by default, real only when apply=true.
+      arista.eos.eos_config:
+        src: "{{ playbook_dir }}/../templates/full_config.j2"
+      vars:
+        device: "{{ intent.data.devices[0] }}"
+      check_mode: "{{ not (apply | bool) }}"
+      register: cfg
+
+    - name: Show the commands that would be sent
+      # cfg.updates is the list of lines eos_config determined are missing from
+      # the running config. Empty list == no drift.
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ 'NO DRIFT — device matches Nautobot intent'
+             if (cfg.updates | default([]) | length == 0)
+             else (cfg.updates | length ~ ' line(s) would change: '
+                   ~ (cfg.updates | join(' | '))) }}
+
+    - name: Remind which mode this ran in
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'APPLIED to the device (apply=true).'
+             if (apply | bool)
+             else 'Check mode — nothing was changed. Re-run with -e apply=true to apply.' }}
+      run_once: true

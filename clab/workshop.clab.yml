@@ -1,0 +1,41 @@
+# ContainerLab topology — 2 Arista cEOS nodes.
+#
+# Import the image first (cEOS ships as a filesystem tarball, so `docker import`,
+# NOT `docker load`):
+#   docker import cEOSarm-lab-4.34.2F.tar.xz ceos:4.34.2F
+#   docker image inspect ceos:4.34.2F --format '{{.Architecture}}/{{.Os}}'
+#
+# Deploy:
+#   sudo containerlab deploy -t clab/workshop.clab.yml
+#   sudo containerlab inspect -t clab/workshop.clab.yml
+#
+# The management IPs below are PINNED and every lab prints them as literals.
+# Do not let the runtime allocate: without `mgmt-ipv4` containerlab hands out
+# addresses in start order, which on 2026-08-26 produced leaf1=.3 and leaf2=.2
+# — reversed, and different on the next run.
+#
+# NOTE: the ARM64 cEOS build is used on Apple Silicon. Lab infrastructure may be
+# x86_64 and needs the non-ARM image at the SAME version (4.34.2F) so findings
+# transfer. The image tag is identical either way.
+
+name: workshop
+
+mgmt:
+  network: clab-workshop
+  ipv4-subnet: 172.20.20.0/24
+
+topology:
+  nodes:
+    leaf1:
+      kind: arista_ceos
+      image: ceos:4.34.2F
+      mgmt-ipv4: 172.20.20.11
+      restart-policy: always
+    leaf2:
+      kind: arista_ceos
+      image: ceos:4.34.2F
+      mgmt-ipv4: 172.20.20.12
+      restart-policy: always
+
+  links:
+    - endpoints: ["leaf1:eth1", "leaf2:eth1"]

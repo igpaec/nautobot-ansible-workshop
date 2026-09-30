@@ -1,0 +1,69 @@
+{#
+  Stage 2b — rendered entirely from ONE GraphQL response.
+
+  Every value below comes from `device`, which is the result of a single query
+  against Nautobot. No REST round-trips, no group_vars, no survey.
+
+  `default()` guards are deliberate: a Config Context need not define every key,
+  and a lab device need not have VLANs or descriptions. A template that explodes
+  on the first missing optional field is a bad demo in front of 60 people.
+#}
+hostname {{ device.name }}
+!
+{% if device.config_context is defined and device.config_context %}
+{% for server in device.config_context.get('ntp_servers', []) %}
+ntp server {{ server }}
+{% endfor %}
+!
+{% for server in device.config_context.get('dns_servers', []) %}
+ip name-server {{ server }}
+{% endfor %}
+!
+{% if device.config_context.get('snmp_community') %}
+snmp-server community {{ device.config_context['snmp_community'] }} ro
+{% endif %}
+{% if device.config_context.get('syslog_host') %}
+logging host {{ device.config_context['syslog_host'] }}
+{% endif %}
+{% endif %}
+!
+{#
+  🔴 NEVER RENDER CONFIG FOR THE OUT-OF-BAND PORT.
+
+  Applying intent to the management interface, over the management interface,
+  is how you disconnect yourself mid-commit. It happened on 2026-09-02: a stale
+  IP left in Nautobot rendered `ip address 172.20.20.2/24` onto leaf2's
+  Management0, whose real address is .12. The commit renumbered the interface,
+  the SSH session died, `commit` never returned a prompt, and the job failed
+  with a 60-second timeout — after the device had already moved.
+
+  The stale IP was the bug and is fixed in seed_nautobot.yml (`state: replace`).
+  This guard is the second line of defence: with it, no data error in Nautobot
+  can take a device off the network. In front of sixty people that difference
+  matters more than the config it would have applied.
+
+  Note `default(false)` — if the GraphQL query ever stops returning mgmt_only,
+  this fails OPEN rather than silently skipping every interface and rendering
+  an empty intent that looks like "no drift".
+#}
+{% for intf in device.interfaces | default([]) if not intf.get('mgmt_only', false) %}
+interface {{ intf.name }}
+{% if intf.description %}
+   description {{ intf.description }}
+{% else %}
+   description managed by Nautobot
+{% endif %}
+{% for ip in intf.ip_addresses | default([]) %}
+   ip address {{ ip.address }}
+{% endfor %}
+{% if intf.untagged_vlan %}
+   switchport access vlan {{ intf.untagged_vlan.vid }}
+{% endif %}
+{% if intf.tagged_vlans %}
+   switchport trunk allowed vlan {{ intf.tagged_vlans | map(attribute='vid') | join(',') }}
+{% endif %}
+{% if not intf.enabled %}
+   shutdown
+{% endif %}
+!
+{% endfor %}

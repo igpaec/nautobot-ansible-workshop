@@ -1,0 +1,119 @@
+---
+# Stage 3c — the traffic reverses. Read state OFF the device, write it INTO
+# Nautobot.
+#
+# Everything so far has been Nautobot -> device. This is the first playbook that
+# goes the other way, and it is the workshop's first real differentiator: the
+# source of truth learns from reality instead of only dictating to it.
+#
+# PREREQUISITE: run playbooks/seed_nautobot.yml first. It creates the custom
+# fields `awx_job_id` and `lldp_neighbors` that this playbook writes to. Writing
+# to a custom field that does not exist fails.
+#
+# HOW TO RUN:
+#   export NAUTOBOT_URL="http://localhost:8080"
+#   export NAUTOBOT_TOKEN="<token>"
+#   ansible-playbook -i inventory/nautobot.yml playbooks/write_back.yml -u admin -k
+#
+# Preview without writing anything:
+#   ansible-playbook -i inventory/nautobot.yml playbooks/write_back.yml -u admin -k --check --diff
+#
+# AFTERWARDS, check the change log — that is the point of the exercise:
+#   Nautobot UI -> Extensibility -> Change Log
+# Each device should show an update attributed to the token's user, carrying the
+# AWX job ID. Lab 4 turns that correlation into an audit trail.
+
+- name: Write discovered state back to Nautobot
+  hosts: all
+  gather_facts: false
+
+  vars:
+    nb: &nb
+      url: "{{ lookup('env', 'NAUTOBOT_URL') }}"
+      token: "{{ lookup('env', 'NAUTOBOT_TOKEN') }}"
+
+    # AWX injects awx_job_id (tower_job_id is the legacy alias) into every job.
+    # Neither exists on a local run, hence the fallback — which is itself useful
+    # in the change log, since it distinguishes laptop runs from AWX runs.
+    job_ref: "{{ awx_job_id | default(tower_job_id | default('local-run')) }}"
+
+  tasks:
+    - name: Gather facts from the device
+      # hardware  -> ansible_net_serialnum, ansible_net_model, ansible_net_version
+      # interfaces -> ansible_net_neighbors (LLDP)
+      arista.eos.eos_facts:
+        gather_subset:
+          - hardware
+          - interfaces
+
+    - name: Show what the device reported
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          version={{ ansible_net_version | default('unknown') }},
+          serial={{ ansible_net_serialnum | default('(none)') }},
+          model={{ ansible_net_model | default('unknown') }},
+          lldp_neighbors={{ ansible_net_neighbors | default({}) | length }}
+
+    # SoftwareVersion is a first-class object in Nautobot 2.2+ (so plainly
+    # present on the 3.2 floor), not a free-text field. It must exist before a
+    # device can reference it — hence this step before the device update.
+    #
+    # 🔴 throttle: 1 IS LOAD-BEARING. Both leaves run the same EOS build, and
+    # SoftwareVersion is unique on (platform, version). Ansible runs this task
+    # for every host in parallel, so without throttling both hosts check "does
+    # it exist?", both get "no", and both INSERT. One wins; the other dies with:
+    #
+    #   psycopg2.errors.UniqueViolation: duplicate key value violates unique
+    #   constraint "dcim_softwareversion_platform_id_version_34b58c7b_uniq"
+    #
+    # Observed 2026-08-27: leaf1 failed, leaf2 succeeded. It is a race, so it is
+    # intermittent — and it passes on a re-run because the object now exists,
+    # which makes it look like a fluke. It is not: a fresh stack hits it every
+    # time, which means every attendee hits it.
+    #
+    # throttle: 1 serialises only this task. Everything else stays parallel.
+    - name: Ensure the discovered software version exists in Nautobot
+      networktocode.nautobot.software_version:
+        <<: *nb
+        version: "{{ ansible_net_version }}"
+        platform: Arista EOS
+        status: Active
+        state: present
+      delegate_to: localhost
+      throttle: 1
+      when: ansible_net_version is defined
+
+    - name: Write serial, software version, and the AWX job ID back to the device
+      networktocode.nautobot.device:
+        <<: *nb
+        name: "{{ inventory_hostname }}"
+        serial: "{{ ansible_net_serialnum | default(omit) }}"
+        software_version: "{{ ansible_net_version | default(omit) }}"
+        custom_fields:
+          awx_job_id: "{{ job_ref }}"
+          lldp_neighbors: "{{ ansible_net_neighbors | default({}) }}"
+        state: present
+      delegate_to: localhost
+      register: writeback
+
+    - name: Confirm, and point at the change log
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}
+          {{ 'UPDATED' if writeback.changed else 'already matched' }} in Nautobot
+          (job ref: {{ job_ref }}). See Extensibility -> Change Log.
+
+# ---------------------------------------------------------------------------
+# WHY LLDP NEIGHBOURS GO INTO A CUSTOM FIELD, NOT REAL CABLE OBJECTS
+#
+# Modelling discovered neighbours as dcim.Cable is the "correct" answer and a
+# genuinely bad workshop step. It needs interface-name normalisation (Et1 vs
+# Ethernet1), handling of pre-existing cables, both termination types, and the
+# right status name — easily 20 minutes of debugging that teaches nothing about
+# Nautobot/AWX integration, which is the actual lesson.
+#
+# A JSON custom field captures the same discovered data, writes back in one
+# task, and keeps the beat crisp. Real cable creation belongs in the STRETCH
+# GOAL, where a fast attendee can afford the detour.
+# ---------------------------------------------------------------------------

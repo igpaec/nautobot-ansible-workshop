@@ -1,0 +1,647 @@
+---
+# Stage 1a — populate Nautobot with the Stage 0 topology.
+#
+# WHAT THIS IS: an ordinary Ansible playbook, but a different shape from
+# configure_base.yml. It runs against `localhost` and talks to Nautobot's REST
+# API through the networktocode.nautobot modules. It never touches leaf1/leaf2 —
+# the devices don't even need to be running.
+#
+# HOW TO RUN:
+#   ansible-playbook playbooks/seed_nautobot.yml
+#
+# No exports needed. No -i inventory either: the play targets localhost. No
+# -u/-k: auth is the Nautobot API token, not SSH.
+#
+# 🔴 NAUTOBOT_URL / NAUTOBOT_TOKEN ARE OPTIONAL OVERRIDES, NOT REQUIREMENTS.
+# Both values are deterministic — every stack is http://localhost:8080 with the
+# pinned literal token from nautobot-ansible-workshop-instructor/00-credentials-and-addressing.md. Requiring
+# them as env vars made the playbook depend on shell state that does not survive
+# a new SSH session, `sudo -i`, or any non-interactive shell that skips .bashrc.
+# See the same note at the top of seed_awx.yml.
+#
+# It is idempotent — safe to re-run. That matters, because you will iterate on
+# it, and because it is the seed of the eventual `reset.sh` for Lab 1.
+#
+# ORDER MATTERS. Nautobot enforces referential integrity, so parents come first:
+#   LocationType → Location → Manufacturer → Platform → DeviceType → Role
+#   → Device → Interface → Prefix → IPAddress → bind IP → set primary_ip4
+
+- name: Seed Nautobot with the workshop topology
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # YAML anchor: the collection defines no module_defaults action group, so
+    # url/token must be passed to every task. `<<: *nb` merges them in.
+    #
+    # `| default(x, true)` — the second argument matters. An unset env var comes
+    # back as an empty string, not undefined, and a bare `| default(x)` would
+    # happily pass "" straight through to every task.
+    nb: &nb
+      url: "{{ lookup('env', 'NAUTOBOT_URL') | default('http://localhost:8080', true) }}"
+      token: "{{ lookup('env', 'NAUTOBOT_TOKEN') | default('0123456789abcdef0123456789abcdef01234567', true) }}"
+
+    site_name: DC1
+    mgmt_prefix: 172.20.20.0/24
+    mgmt_interface: Management0
+
+    # Nautobot clones this itself to discover the Jobs in jobs/ — so it must be
+    # a URL Nautobot's worker can reach, not a local path.
+    lab_repo_url: https://github.com/igpaec/nautobot-ansible-workshop.git
+    lab_repo_branch: main
+
+    # These MUST match clab/workshop.clab.yml's pinned mgmt-ipv4 values, and the
+    # literals printed in the attendee labs. Lab 1's dynamic inventory builds
+    # ansible_host from primary_ip4, so a mismatch here sends every playbook to
+    # the wrong address — with no error that says so.
+    #
+    # Corrected 2026-08-26: these were .3 and .2, copied from an unpinned
+    # ContainerLab run where the nodes came up in reverse order.
+    #
+    # 🔴 `status` IS PER DEVICE, AND leaf2 MUST NOT START Active.
+    #
+    # Found 2026-09-04 while building reset.sh. Both devices used to be seeded
+    # `Active`, which makes **Lab 4 impossible on a clean stack**: step 4d tells
+    # the attendee to set leaf2's status to Active, and if it is already Active
+    # that edit changes nothing — no ObjectChange, no webhook, no workflow. The
+    # lab appears to do nothing at all, with no error anywhere.
+    #
+    # It went unnoticed because the first Lab 4 run happened on a stack where
+    # leaf2 had already been flipped by hand during debugging.
+    #
+    # `Planned` is also better content, not a workaround: leaf2 is the site
+    # being turned up, and "planned but not yet live" is exactly what the
+    # workflow is called `Site Turnup (gated)` for.
+    workshop_devices:
+      - name: leaf1
+        status: Active
+        mgmt_ip: 172.20.20.11/24
+        eth1_description: to leaf2 Ethernet1
+      - name: leaf2
+        status: Planned
+        mgmt_ip: 172.20.20.12/24
+        eth1_description: to leaf1 Ethernet1
+
+    # ---------------------------------------------------------- Lab 2 content
+    # Same keys as inventory/group_vars/leaf.yml, deliberately. Lab 2 deletes
+    # that file and the playbook keeps working because Nautobot serves these
+    # instead — which is the whole point of the lab.
+    leaf_base_context:
+      ntp_servers:
+        - 10.0.0.1
+        - 10.0.0.2
+      dns_servers:
+        - 10.0.0.53
+      snmp_community: public
+      mgmt_vrf: MGMT
+      syslog_host: 10.0.0.10
+
+    # JSON Schema for the above. Lab 2d has the attendee set ntp_servers to a
+    # plain string and watch Nautobot refuse it, so the array constraint is the
+    # part that has to bite.
+    leaf_base_schema:
+      title: leaf-base
+      type: object
+      properties:
+        ntp_servers:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            format: ipv4
+        dns_servers:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            format: ipv4
+        snmp_community:
+          type: string
+          minLength: 1
+        mgmt_vrf:
+          type: string
+        syslog_host:
+          type: string
+          format: ipv4
+      required:
+        - ntp_servers
+
+  tasks:
+    # Pre-flight against what actually breaks. The credentials are static, so
+    # they are never the problem; Nautobot being down, still migrating, or on a
+    # different port is. Checking the AUTHENTICATED root catches both
+    # reachability and a bad token in one call — a 401/403 here means the token
+    # is wrong, which is the only credential failure worth reporting.
+    - name: Check Nautobot is reachable and the token works
+      ansible.builtin.uri:
+        url: "{{ nb.url }}/api/"
+        method: GET
+        headers:
+          Authorization: "Token {{ nb.token }}"
+          Accept: application/json
+        timeout: 10
+      register: nb_ping
+      failed_when: false
+      changed_when: false
+      tags: [reset]
+
+    - name: Explain it if Nautobot is not answering
+      ansible.builtin.assert:
+        that: nb_ping.status == 200
+        fail_msg: >-
+          Nautobot at {{ nb.url }} returned {{ nb_ping.status }}.
+          401/403 means the API token is wrong — check it against
+          nautobot-ansible-workshop-instructor/00-credentials-and-addressing.md, or export NAUTOBOT_TOKEN to
+          override. Anything else (-1, 000, 502) means Nautobot is not up:
+          `cd ~/nautobot-docker-compose && docker compose ps` and give it a
+          minute if it is still migrating.
+        success_msg: "Nautobot answering at {{ nb.url }}"
+      tags: [reset]
+
+    # ----------------------------------------------- custom fields (Stage 3)
+    # Schema setup, so it belongs here rather than in the write-back playbook.
+    # Nautobot 2.x+ uses `key` (the old `slug`) as the programmatic name — that
+    # is what `custom_fields:` refers to when writing values.
+    - name: Custom field — AWX job ID
+      networktocode.nautobot.custom_field:
+        <<: *nb
+        key: awx_job_id
+        label: AWX Job ID
+        type: text
+        content_types:
+          - dcim.device
+        description: >-
+          Set by playbooks/write_back.yml. Links this device to the AWX job that
+          last touched it — the correlation Lab 4 closes the loop on.
+        state: present
+
+    - name: Custom field — discovered LLDP neighbors
+      networktocode.nautobot.custom_field:
+        <<: *nb
+        key: lldp_neighbors
+        label: LLDP Neighbors (discovered)
+        type: json
+        content_types:
+          - dcim.device
+        description: >-
+          Discovered at runtime and written back. A JSON field rather than real
+          Cable objects on purpose — see write_back.yml for the reasoning.
+        state: present
+
+    # ---------------------------------------------------------------- location
+    - name: Location type
+      networktocode.nautobot.location_type:
+        <<: *nb
+        name: Site
+        content_types:
+          - dcim.device
+        state: present
+
+    - name: Location
+      networktocode.nautobot.location:
+        <<: *nb
+        name: "{{ site_name }}"
+        location_type: Site
+        status: Active
+        state: present
+
+    # ------------------------------------------------------------ device model
+    - name: Manufacturer
+      networktocode.nautobot.manufacturer:
+        <<: *nb
+        name: Arista
+        state: present
+
+    - name: Platform
+      networktocode.nautobot.platform:
+        <<: *nb
+        name: Arista EOS
+        manufacturer: Arista
+        # netutils driver name. Stage 1b's inventory `compose:` should read the
+        # Ansible mapping off this rather than using the raw value — see the
+        # note in tutorial.md Stage 1b about network_driver_mappings.
+        network_driver: arista_eos
+        state: present
+
+    - name: Device type
+      networktocode.nautobot.device_type:
+        <<: *nb
+        model: cEOSLab
+        manufacturer: Arista
+        u_height: 1
+        state: present
+
+    # Registered: the Config Context below scopes itself to this role and needs
+    # its UUID. The module returns the object whether it created it or found it
+    # already there, so this is safe on a re-run.
+    #   🔴 TAGGED `reset` EVEN THOUGH A RESET NEVER CHANGES A ROLE. It is here
+    # for `role_leaf`, which the Config Context task below needs for its scope.
+    # Without the tag, `reset.sh` skipped this task and died on an undefined
+    # variable — found 2026-09-25, the first time reset.sh was ever run.
+    #   The general trap: a tagged task must not depend on a register from an
+    # untagged one. Adding `tags: [reset]` to a task that reads a variable is
+    # half a fix; whatever produced the variable needs the tag too.
+    - name: Role
+      networktocode.nautobot.role:
+        <<: *nb
+        name: leaf
+        content_types:
+          - dcim.device
+        state: present
+      register: role_leaf
+      tags: [reset]
+
+    # ----------------------------------------------------------------- devices
+    - name: Devices
+      networktocode.nautobot.device:
+        <<: *nb
+        name: "{{ item.name }}"
+        device_type: cEOSLab
+        role: leaf
+        platform: Arista EOS
+        location: "{{ site_name }}"
+        status: "{{ item.status }}"
+        state: present
+      loop: "{{ workshop_devices }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags: [reset]
+
+    # -------------------------------------------------------------------- IPAM
+    # IPAM comes BEFORE the interfaces, because the interface task binds the
+    # addresses inline and they must already exist.
+    #
+    # Nautobot 2.x+ scopes IPs inside a Namespace. "Global" ships by default.
+    - name: Management prefix
+      networktocode.nautobot.prefix:
+        <<: *nb
+        prefix: "{{ mgmt_prefix }}"
+        namespace: Global
+        status: Active
+        state: present
+
+    - name: Management IP addresses
+      networktocode.nautobot.ip_address:
+        <<: *nb
+        address: "{{ item.mgmt_ip }}"
+        namespace: Global
+        status: Active
+        state: present
+      loop: "{{ workshop_devices }}"
+      loop_control:
+        label: "{{ item.mgmt_ip }}"
+
+    # Interface creation AND IP binding in one task.
+    #
+    # Do NOT use networktocode.nautobot.ip_address_to_interface here: it is
+    # deprecated in 6.2.0 (removal in 7.0.0) and it has no `device` parameter,
+    # so there is no way to disambiguate "Management0 on leaf1" from
+    # "Management0 on leaf2". The `ip_addresses` option below replaces it and
+    # was added in exactly 6.2.0.
+    #
+    # `ip_addresses` is a DICT, not a list:
+    #   state:   merge (default) | replace | delete
+    #   objects: list of dicts, each with an `ip_address` key
+    #
+    # 🔴 `replace`, NOT the default `merge`. This one bit hard on 2026-09-02.
+    #
+    # `merge` "adds associations without removing existing ones". So when the
+    # ContainerLab addresses were corrected from .2/.3 to .11/.12 and this
+    # playbook was re-run, it ADDED the new IPs and left the old ones bound.
+    # Management0 on leaf2 ended up holding both 172.20.20.2/24 and
+    # 172.20.20.12/24, and nothing anywhere said so:
+    #
+    #   * `primary_ip4` was correct, so the dynamic inventory worked
+    #   * every playbook reached the device fine
+    #   * the GraphQL query returns ip_addresses as a LIST, so full_config.j2
+    #     rendered `ip address 172.20.20.2/24` into the intent
+    #
+    # It surfaced only when Lab 4 ran the first-ever `apply=true`: the commit
+    # renumbered Management0 out from under its own SSH session, `commit` never
+    # returned a prompt, and the job died with a 60-second timeout while the
+    # device silently moved to the wrong address.
+    #
+    # `replace` "enforces exactly the listed associations, removing any extras",
+    # which is what a seed playbook should always mean. **A seed that only adds
+    # is not idempotent — it is cumulative**, and the difference is invisible
+    # until something reads the whole list instead of just the primary.
+    - name: Management interfaces (with IPs bound)
+      networktocode.nautobot.device_interface:
+        <<: *nb
+        device: "{{ item.name }}"
+        name: "{{ mgmt_interface }}"
+        type: 1000base-t
+        mgmt_only: true
+        status: Active
+        ip_addresses:
+          state: replace
+          objects:
+            - ip_address: "{{ item.mgmt_ip }}"
+        state: present
+      loop: "{{ workshop_devices }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # A real data interface, so intent has something to say that is not the
+    # out-of-band port. Added 2026-09-02 alongside the mgmt_only guard in
+    # full_config.j2 — with Management0 excluded from rendered config, the
+    # interface section of the template would otherwise be empty and Lab 2
+    # would lose half its point.
+    #
+    # No IP: leaf1:eth1 <-> leaf2:eth1 is a plain L2 link in the topology.
+    - name: Data interfaces
+      networktocode.nautobot.device_interface:
+        <<: *nb
+        device: "{{ item.name }}"
+        name: Ethernet1
+        type: 1000base-t
+        mgmt_only: false
+        enabled: true
+        status: Active
+        description: "{{ item.eth1_description }}"
+        state: present
+      loop: "{{ workshop_devices }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # Must come last: the IP has to exist and be bound before it can be primary.
+    # Stage 1b's dynamic inventory reads primary_ip4 to build ansible_host, so
+    # if this task fails, Lab 1 produces hosts with no address.
+    - name: Set primary IPv4
+      networktocode.nautobot.device:
+        <<: *nb
+        name: "{{ item.name }}"
+        primary_ip4: "{{ item.mgmt_ip }}"
+        state: present
+      loop: "{{ workshop_devices }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ------------------------------------------- Dynamic Group (Lab 1c)
+    # Nautobot 3.x requires group_type. `dynamic-filter` is the one whose
+    # membership is computed from `filter` — the other two are `static` and
+    # `dynamic-set`, neither of which is what Lab 1c demonstrates.
+    #
+    # Note the filter values are LISTS. Nautobot's filter syntax mirrors the
+    # REST API's query parameters, where every value is multi-valued.
+    - name: Dynamic Group — leaf devices at DC1
+      networktocode.nautobot.dynamic_group:
+        <<: *nb
+        name: leaf-devices-dc1
+        group_type: dynamic-filter
+        content_type: dcim.device
+        description: >-
+          Lab 1c targets this group by name. Membership is a live query, not a
+          list — add a device matching the filter and it appears here.
+        filter:
+          role:
+            - leaf
+          location:
+            - "{{ site_name }}"
+        state: present
+      tags: [reset]
+
+    # ------------------------------------------- Config Context (Lab 2)
+    # No collection module exists for Config Contexts or their Schemas in
+    # networktocode.nautobot 6.2.0 — only `dynamic_group`. So these two go
+    # through the REST API directly.
+    #
+    # Field names verified against Nautobot 3.2.3's models:
+    #   ConfigContextSchema: name, description, data_schema
+    #   ConfigContext:       name, weight, description, is_active, data,
+    #                        config_context_schema, and M2M scopes including
+    #                        `roles` (extras.Role, not a dcim device role)
+    #
+    # Both are idempotent by name: query first, then POST or PATCH.
+    - name: Look up the Config Context Schema
+      ansible.builtin.uri:
+        url: "{{ nb.url }}/api/extras/config-context-schemas/?name=leaf-base-schema"
+        method: GET
+        headers: &nb_headers
+          Authorization: "Token {{ nb.token }}"
+          Accept: application/json
+        status_code: 200
+      register: schema_lookup
+      tags: [reset]
+
+    - name: Config Context Schema — leaf-base-schema
+      ansible.builtin.uri:
+        url: >-
+          {{ nb.url }}/api/extras/config-context-schemas/{{
+          (schema_lookup.json.results | first).id ~ '/' if schema_lookup.json.count > 0 else '' }}
+        method: "{{ 'PATCH' if schema_lookup.json.count > 0 else 'POST' }}"
+        headers: *nb_headers
+        body_format: json
+        body:
+          name: leaf-base-schema
+          description: >-
+            Validates leaf-base. Lab 2d proves this rejects a bad ntp_servers
+            before it can reach a device.
+          data_schema: "{{ leaf_base_schema }}"
+        status_code: [200, 201]
+      register: schema_result
+      tags: [reset]
+
+    - name: Look up the Config Context
+      ansible.builtin.uri:
+        url: "{{ nb.url }}/api/extras/config-contexts/?name=leaf-base"
+        method: GET
+        headers: *nb_headers
+        status_code: 200
+      register: context_lookup
+      tags: [reset]
+
+    - name: Config Context — leaf-base
+      ansible.builtin.uri:
+        url: >-
+          {{ nb.url }}/api/extras/config-contexts/{{
+          (context_lookup.json.results | first).id ~ '/' if context_lookup.json.count > 0 else '' }}
+        method: "{{ 'PATCH' if context_lookup.json.count > 0 else 'POST' }}"
+        headers: *nb_headers
+        body_format: json
+        body:
+          name: leaf-base
+          weight: 1000
+          is_active: true
+          description: >-
+            Serves the variables that inventory/group_vars/leaf.yml used to
+            hold. Scoped to the role, not to devices — any new leaf inherits it.
+          config_context_schema: "{{ schema_result.json.id }}"
+          # Scope. This is what makes Lab 2's point: attached to a rule, not a device.
+          roles:
+            - "{{ role_leaf.role.id }}"
+          data: "{{ leaf_base_context }}"
+        status_code: [200, 201]
+      tags: [reset]
+
+    # ------------------------------------------- Secrets Group (Lab 3c)
+    # Lab 3c asks attendees to compare Nautobot's way of holding device
+    # credentials with AWX's, and to decide which should own them. Without a
+    # Secrets Group to look at, one side of that comparison is an empty list.
+    #
+    # Deliberately an ENVIRONMENT-VARIABLE secret, not a literal: the lesson is
+    # that Nautobot stores a *reference* to a secret and binds it to a device —
+    # it does not store the secret itself. The variable need not exist for the
+    # object to be worth looking at.
+    - name: Secret — device password reference
+      networktocode.nautobot.secret:
+        <<: *nb
+        name: cEOS admin password
+        provider: environment-variable
+        parameters:
+          variable: NAPALM_PASSWORD
+        description: >-
+          A pointer, not a password. Nautobot resolves this at use time from the
+          worker's environment — the value never lives in the database.
+        state: present
+
+    - name: Secrets Group — cEOS device access
+      networktocode.nautobot.secrets_group:
+        <<: *nb
+        name: cEOS device access
+        description: >-
+          Lab 3c compares this with the AWX Machine credential. Same job, two
+          places it could live — see the lab for why picking one matters.
+        state: present
+
+    - name: Bind the secret into the group
+      networktocode.nautobot.secrets_groups_association:
+        <<: *nb
+        secrets_group: cEOS device access
+        secret: cEOS admin password
+        access_type: Generic
+        secret_type: password
+        state: present
+
+    # ------------------------------------------- Git Repository + Jobs (Lab 3a)
+    # This is what puts the "Run in AWX" button on a device page.
+    #
+    # There is no git_repository module in networktocode.nautobot 6.2.0, so the
+    # repository goes through the REST API — same look-then-POST-or-PATCH shape
+    # as the Config Context above. Field names verified against Nautobot 3.2.3's
+    # GitRepository model: name, remote_url, branch, provided_contents.
+    - name: Look up the Git Repository
+      ansible.builtin.uri:
+        url: "{{ nb.url }}/api/extras/git-repositories/?name=nautobot-ansible-workshop"
+        method: GET
+        headers: *nb_headers
+        status_code: 200
+      register: repo_lookup
+
+    - name: Git Repository — the lab repo, providing jobs
+      ansible.builtin.uri:
+        url: >-
+          {{ nb.url }}/api/extras/git-repositories/{{
+          (repo_lookup.json.results | first).id ~ '/' if repo_lookup.json.count > 0 else '' }}
+        method: "{{ 'PATCH' if repo_lookup.json.count > 0 else 'POST' }}"
+        headers: *nb_headers
+        body_format: json
+        body:
+          name: nautobot-ansible-workshop
+          remote_url: "{{ lab_repo_url }}"
+          branch: "{{ lab_repo_branch }}"
+          provided_contents:
+            - extras.job
+        status_code: [200, 201]
+      register: repo_result
+
+    # Sync is a POST to /sync/. It ENQUEUES a Celery task and returns 200
+    # immediately, so a success here means "accepted", not "worked".
+    - name: Sync the Git Repository
+      ansible.builtin.uri:
+        url: "{{ nb.url }}/api/extras/git-repositories/{{ repo_result.json.id }}/sync/"
+        method: POST
+        headers: *nb_headers
+        status_code: [200, 201, 202]
+      register: sync_request
+
+    # Follow the JobResult rather than polling for the Job to appear.
+    #
+    # An earlier version skipped straight to "wait for the Job", which failed
+    # after 12 silent retries and said nothing about WHY — the sync could have
+    # failed to clone, hit an import error, or never run at all because the
+    # celery worker was down. Watching the JobResult turns all of those into a
+    # message.
+    - name: Wait for the sync to finish
+      ansible.builtin.uri:
+        url: "{{ nb.url }}/api/extras/job-results/{{ sync_request.json.job_result.id }}/"
+        method: GET
+        headers: *nb_headers
+        status_code: 200
+      register: sync_result
+      until: (sync_result.json.status.value | default(sync_result.json.status)) in ['SUCCESS', 'FAILURE', 'REVOKED']
+      retries: 24
+      delay: 5
+
+    # 🔴 Stuck on PENDING means the celery worker is not consuming the queue.
+    # Nothing is wrong with the repository — check `docker ps` for
+    # nautobot_docker_compose-celery_worker-1.
+    - name: Report the sync outcome
+      ansible.builtin.assert:
+        that:
+          - (sync_result.json.status.value | default(sync_result.json.status)) == 'SUCCESS'
+        fail_msg: >-
+          Git repository sync did not succeed — status
+          {{ sync_result.json.status.value | default(sync_result.json.status) }}.
+          Read the log at {{ nb.url }}/extras/job-results/{{ sync_request.json.job_result.id }}/
+          If it never left PENDING, the celery worker is not running.
+
+    - name: Wait for the Job to be imported
+      ansible.builtin.uri:
+        url: "{{ nb.url }}/api/extras/jobs/?name=Launch%20AWX%20job%20for%20this%20device"
+        method: GET
+        headers: *nb_headers
+        status_code: 200
+      register: job_lookup
+      until: job_lookup.json.count > 0
+      retries: 6
+      delay: 5
+
+    # If the sync succeeded but no Job appeared, the repository was fetched and
+    # `jobs/` either is not at its root or failed to import. Check the same
+    # JobResult log — the importer records the exception there.
+    - name: Explain a successful sync that imported no Job
+      ansible.builtin.assert:
+        that:
+          - job_lookup.json.count > 0
+        fail_msg: >-
+          Sync succeeded but no Job named "Launch AWX job for this device"
+          exists. Either jobs/ is missing from the pushed repository, or the
+          module raised on import. The traceback is in the sync log:
+          {{ nb.url }}/extras/job-results/{{ sync_request.json.job_result.id }}/
+
+    # 🔴 Jobs import DISABLED. Nautobot will not run one until this is flipped,
+    # and the failure is silent from the button's point of view.
+    - name: Enable the Job
+      ansible.builtin.uri:
+        url: "{{ nb.url }}/api/extras/jobs/{{ (job_lookup.json.results | first).id }}/"
+        method: PATCH
+        headers: *nb_headers
+        body_format: json
+        body:
+          enabled: true
+        status_code: 200
+
+    - name: Job Button — Run in AWX
+      networktocode.nautobot.job_button:
+        <<: *nb
+        name: Run in AWX
+        content_types:
+          - dcim.device
+        job: Launch AWX job for this device
+        text: Run in AWX
+        button_class: primary
+        enabled: true
+        confirmation: false
+        state: present
+
+    # ------------------------------------------------------------ verification
+    - name: Next step
+      ansible.builtin.debug:
+        msg: >-
+          Seeded {{ workshop_devices | length }} devices at {{ site_name }},
+          plus Config Context leaf-base (schema-validated) and Dynamic Group
+          leaf-devices-dc1. Verify:
+          ansible-inventory -i inventory/nautobot.yml --graph
+          then: ansible-inventory -i inventory/nautobot.yml --host leaf1 | jq '.ntp_servers'

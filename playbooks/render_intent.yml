@@ -1,0 +1,92 @@
+---
+# Stage 2b — fetch a device's full intent in ONE GraphQL query, then render it.
+#   WHAT THIS DEMONSTRATES: instead of many REST round-trips (device, then role,
+# then platform, then interfaces, then IPs...), a single GraphQL call returns
+# exactly the shape the template needs. That is the "one query drives the config"
+# beat of Lab 2.
+#   HOW TO RUN:
+#   export NAUTOBOT_URL="http://localhost:8080"
+#   export NAUTOBOT_TOKEN="<token>"
+#   ansible-playbook -i inventory/nautobot.yml playbooks/render_intent.yml
+#   NOTE: no -u / -k needed. Every task is delegated to localhost, so this never
+# touches the devices — it only reads Nautobot and writes files locally. The
+# devices don't even have to be running.
+#   To inspect the raw response shape (useful on the first run, see below):
+#   ansible-playbook -i inventory/nautobot.yml playbooks/render_intent.yml -e show_raw=true
+
+- name: Render config from Nautobot intent
+  hosts: all
+  gather_facts: false
+
+  vars:
+    render_dir: "{{ playbook_dir }}/../rendered"
+
+  tasks:
+    - name: Ensure the output directory exists
+      # rendered/ is in .gitignore, so it will not exist on a fresh clone.
+      ansible.builtin.file:
+        path: "{{ render_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      run_once: true
+
+    # Query by NAME, not UUID.
+    #
+    # The inventory plugin does NOT expose the Nautobot device UUID as a hostvar.
+    # Confirmed by reading the 6.2.0 source: hostvars come from a fixed set of
+    # extract_* methods (platform, role, location, primary_ip4, interfaces,
+    # config_context, tags, custom_fields, ...) and there is no extract_id.
+    # `inventory_hostname` always exists, so name is the dependable key.
+    #
+    # To see everything that IS available for a host:
+    #   ansible-inventory -i inventory/nautobot.yml --host leaf1 | jq 'keys'
+    - name: Fetch the device's full intent in one GraphQL query
+      networktocode.nautobot.graphql_info:
+        url: "{{ lookup('env', 'NAUTOBOT_URL') }}"
+        token: "{{ lookup('env', 'NAUTOBOT_TOKEN') }}"
+        query: "{{ lookup('file', playbook_dir + '/../graphql/device_intent.gql') }}"
+        graph_variables:
+          # Nautobot's GraphQL filters are usually multi-value, hence a list.
+          # If the schema rejects it, check the arg type in GraphiQL's Docs pane
+          # and drop the brackets.
+          device_name: ["{{ inventory_hostname }}"]
+        validate_certs: false
+      register: intent
+      delegate_to: localhost
+
+    - name: Show the raw response shape
+      # The exact key the module returns under is worth confirming once rather
+      # than assuming. Run with -e show_raw=true the first time.
+      ansible.builtin.debug:
+        var: intent
+      when: show_raw | default(false) | bool
+
+    # `devices(...)` returns a LIST, so the result is data.devices[0] — unlike
+    # the singular `device(id:)` form, which returns one object.
+    - name: Fail with guidance if the result shape isn't what we expect
+      ansible.builtin.assert:
+        that:
+          - intent.data is defined
+          - intent.data.devices is defined
+          - intent.data.devices | length == 1
+        fail_msg: >-
+          Expected exactly one device at intent.data.devices for
+          '{{ inventory_hostname }}' (got
+          {{ intent.data.devices | default([]) | length }}).
+          Re-run with '-e show_raw=true' to print the registered value and adjust
+          the path, or check that the device name in Nautobot matches the
+          inventory hostname exactly.
+
+    - name: Render the device config from that single query
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/full_config.j2"
+        dest: "{{ render_dir }}/{{ inventory_hostname }}.cfg"
+        mode: "0644"
+      vars:
+        device: "{{ intent.data.devices[0] }}"
+      delegate_to: localhost
+
+    - name: Where to look
+      ansible.builtin.debug:
+        msg: "Rendered {{ render_dir }}/{{ inventory_hostname }}.cfg"

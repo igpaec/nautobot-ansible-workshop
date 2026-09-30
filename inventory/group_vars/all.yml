@@ -1,0 +1,43 @@
+---
+# Ansible CONNECTION PLUMBING — applies to every host, from any inventory.
+#
+# Why this file exists, and why these vars are not in the inventory plugin's
+# `compose:` block:
+#
+#   compose values are Jinja2 EXPRESSIONS. String literals survive if you quote
+#   them twice ("'enable'"), but a bare YAML boolean (`ansible_become: true`)
+#   does not template reliably — it is silently dropped, and the only symptom is
+#   `operation requires privilege escalation` at the first module that needs
+#   enable mode. Everything else looks fine, which makes it a nasty one to chase.
+#
+# Design rule that follows: `compose:` should only hold values genuinely DERIVED
+# FROM NAUTOBOT (ansible_host from primary_ip4). Static Ansible plumbing belongs
+# here.
+#
+# This also gives Lab 2 a clean split:
+#   group_vars/all.yml   -> connection plumbing            (permanent)
+#   group_vars/leaf.yml  -> device config data            (deleted in Lab 2,
+#                                                          replaced by Config
+#                                                          Contexts)
+
+ansible_connection: ansible.netcommon.network_cli
+ansible_network_os: arista.eos.eos
+
+# Force paramiko rather than libssh.
+#
+# ansible.netcommon prefers ansible-pylibssh when it is installed, and libssh
+# does NOT honour `[paramiko_connection] look_for_keys = False` in ansible.cfg —
+# which is the setting that stops "Too many authentication failures" against
+# cEOS. Pinning the type here makes that fix apply.
+#
+# static.ini sets this too, for Lab 0. It is repeated here because that file
+# only covers the static inventory, and Labs 1+ use the Nautobot plugin. Without
+# it, installing ansible-pylibssh at any point would silently switch the dynamic
+# path to libssh and reintroduce an auth failure nobody would connect to it.
+ansible_network_cli_ssh_type: paramiko
+
+# cEOS: admin lands at a privilege level that still needs `enable` for config
+# mode. Without both of these, eos_config fails with
+# "operation requires privilege escalation".
+ansible_become: true
+ansible_become_method: enable

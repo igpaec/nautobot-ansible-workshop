@@ -1,0 +1,55 @@
+---
+# Stage 0 — base configuration from a static inventory + survey.
+#
+# This playbook does NOT change for the rest of the workshop. Lab 1 swaps the
+# inventory underneath it; Lab 2 swaps where the variables come from. That the
+# playbook stays identical is the entire argument for a source of truth, so
+# resist the urge to "improve" it in later stages.
+
+- name: Base configuration
+  hosts: all
+  gather_facts: false
+
+  pre_tasks:
+    # The AWX survey collects flat values (ntp_primary, ntp_secondary,
+    # dns_server) because a survey can't collect a list. The template wants
+    # lists. Bridge the two with set_fact.
+    #
+    # NOTE: this must be set_fact, not play `vars:`. Defining `ntp_servers` in
+    # `vars:` in terms of `ntp_servers` is a self-reference and Ansible fails
+    # with "recursive loop detected in template string". set_fact has higher
+    # precedence than group_vars, so it cleanly overrides — and when the survey
+    # vars are absent (local run), it's skipped and group_vars stands.
+    - name: Build NTP list from survey answers
+      ansible.builtin.set_fact:
+        ntp_servers: "{{ [ntp_primary, ntp_secondary] | reject('none') | list }}"
+      when: ntp_primary is defined
+
+    - name: Build DNS list from survey answers
+      ansible.builtin.set_fact:
+        dns_servers: "{{ [dns_server] }}"
+      when: dns_server is defined
+
+    - name: Sanity check — required variables are present
+      ansible.builtin.assert:
+        that:
+          - ntp_servers | default([]) | length > 0
+          - dns_servers | default([]) | length > 0
+          - snmp_community is defined
+          - syslog_host is defined
+        fail_msg: >-
+          Missing base config variables. Running locally? Check that
+          inventory/group_vars/leaf.yml sits beside the inventory file, not at
+          the repo root. Running from AWX? Check the survey is enabled and
+          answered, and that the inventory source synced the group_vars.
+
+  tasks:
+    - name: Push base config
+      arista.eos.eos_config:
+        src: ../templates/base.j2
+      register: result
+
+    - name: Show what changed
+      ansible.builtin.debug:
+        var: result.updates
+      when: result.updates is defined

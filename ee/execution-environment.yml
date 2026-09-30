@@ -1,0 +1,188 @@
+---
+# Custom execution environment for the Nautobot + Ansible workshop.
+#
+# 🔴 WHY THIS EXISTS. The stock EE cannot run this workshop's collections.
+#
+# Measured 2026-09-02 on the first Lab 4 run. `quay.io/ansible/awx-ee:24.6.1`
+# — the newest tagged EE, matching our AWX — ships **ansible-core 2.15.12**:
+#
+#   [WARNING]: Collection networktocode.nautobot does not support Ansible version 2.15.12
+#   [WARNING]: Collection arista.eos does not support Ansible version 2.15.12
+#   fatal: [leaf1 -> localhost]: FAILED! => {"msg": "pynautobot must be installed to use this plugin"}
+#
+# Three problems, one image:
+#
+#   networktocode.nautobot   requires_ansible >= 2.17.0   EE has 2.15.12
+#   arista.eos               requires_ansible >= 2.16.0   EE has 2.15.12
+#   pynautobot               needed by graphql_info        absent
+#
+# ⚠️ Lab 1 hid this. Its inventory sync passes on the stock EE because the
+# Nautobot inventory *plugin* uses plain HTTP, needs no pynautobot, and treats
+# the version mismatch as a warning. Only a MODULE run surfaces it — which is
+# why "the playbooks work from the VM" proved so much less than it looked.
+#
+# ⚠️ `awx-ee:latest` is not the answer either. It is built from devel, so it
+# floats — the exact failure mode this project pins everything to avoid — and
+# it still would not carry pynautobot.
+#
+# ------------------------------------------------------------------ BUILDING
+#
+#   /opt/ansible/bin/pip install ansible-builder==3.1.1
+#   cd ~/nautobot-ansible-workshop/ee && /opt/ansible/bin/ansible-builder build --tag workshop-ee:1.0.0 --container-runtime docker
+#   minikube -p awx image load workshop-ee:1.0.0
+#
+# Then point AWX at it — `seed_awx.yml` does this, or by hand:
+#   Administration -> Execution Environments -> workshop-ee -> Image: workshop-ee:1.0.0
+#
+# `minikube image load` is the single-stack answer and needs no registry. For
+# 60 stacks this image has to be mirrored like every other — that is G10 /
+# the image-mirroring gap, deliberately not solved here.
+#
+# ⚠️ Pull policy must NOT be "always" for a locally loaded image — AWX would
+# try to fetch `workshop-ee:1.0.0` from a registry that has never heard of it.
+# seed_awx.yml sets `pull: missing`.
+
+version: 3
+
+images:
+  base_image:
+    # Pinned to the same version as AWX itself. We are layering onto it rather
+    # than starting from a bare base so we inherit the plumbing AWX expects an
+    # EE to have — in particular the `receptor` binary at /usr/bin/receptor,
+    # which is Go and therefore unaffected by the Python swap below.
+    name: quay.io/ansible/awx-ee:24.6.1
+
+dependencies:
+  # 🔴 WITHOUT THIS THE BUILD FAILS, AND THE ERROR NAMES THE WRONG THING.
+  #
+  # awx-ee:24.6.1 is CentOS Stream 9, whose default `/usr/bin/python3` is
+  # **3.9**. ansible-core 2.18 requires Python >= 3.11, so pip refuses:
+  #
+  #   ERROR: Ignored the following versions that require a different python
+  #          version: ... 2.18.19 Requires-Python >=3.11 ...
+  #   ERROR: No matching distribution found for ansible-core==2.18.19
+  #
+  # It reads as "that version does not exist". It does — the interpreter is too
+  # old. The giveaway is that the "from versions:" list stops at 2.15.13, which
+  # is exactly the Python 3.9 ceiling, and 2.15.12 is what the stock EE ships.
+  # So the EE's ansible-core version was never a packaging choice; it is a
+  # consequence of the base image's Python.
+  #
+  # This is ansible-builder v3's supported way to move it. Upstream awx-ee does
+  # the same thing on the same base — see its execution-environment.yml on the
+  # devel branch, which is where this stanza is copied from.
+  python_interpreter:
+    package_system: python3.12
+    python_path: /usr/bin/python3.12
+
+  # The whole point of the rebuild. 2.18.19 matches the VM's venv from
+  # 01-server-prep.md, so a playbook behaves the same run by hand and run by
+  # AWX — which has not been true until now.
+  ansible_core:
+    package_pip: ansible-core==2.18.19
+
+  # Reinstalled under 3.12 deliberately. The base image has these under 3.9;
+  # the console scripts land in the same place, so the later install wins and
+  # AWX's entrypoint gets the 3.12 runner rather than a 3.9 one that cannot
+  # import the ansible-core we just installed.
+  ansible_runner:
+    package_pip: ansible-runner
+
+  system: |
+    python3.12-devel [platform:rpm compile]
+    gcc [platform:rpm compile]
+
+  # 🔴 ONE SOURCE. Relative to THIS file — ansible-builder resolves dependency
+  # paths against the definition's own directory (user_definition.py,
+  # `reference_path = os.path.dirname(self.filename)`), so this is the same
+  # requirements file AWX uses at project-sync time. Do not copy it here; a
+  # second copy is exactly how the EE and the project drift apart.
+  galaxy: ../collections/requirements.yml
+
+  python:
+    # networktocode.nautobot's modules import this. The inventory plugin does
+    # not, which is why Lab 1 passed and Lab 2 did not.
+    - pynautobot==3.1.1
+    # arista.eos over network_cli. `ansible_network_cli_ssh_type: paramiko` is
+    # set in ansible.cfg, and no collection install provides the library —
+    # troubleshooting.md § 13 hit this on the VM, and a pod has even less.
+    - paramiko==5.0.0
+    # Present in the base under Python 3.9. Reinstalled under 3.12 so it is
+    # importable by the interpreter everything else now runs on.
+    - receptorctl
+
+  # 🔴 WITHOUT THIS THE BUILD FAILS ON A COLLECTION WE DO NOT USE.
+  #
+  #   azure-cli-core 2.61.0 depends on paramiko<4.0.0 and >=2.0.8
+  #   ERROR: ResolutionImpossible
+  #
+  # awx-ee is a kitchen-sink image: it bakes in thirteen cloud and platform
+  # collections. ansible-builder's `introspect.py` scans EVERY installed
+  # collection — including the ones that arrived in the base image — and merges
+  # their requirements.txt into one pip resolve. So `azure.azcollection` pulls
+  # `azure-cli-core`, which caps paramiko below 4, and our `paramiko==5.0.0`
+  # makes the set unsolvable.
+  #
+  # Two ways out, and the obvious one is wrong: dropping our paramiko pin lets
+  # pip settle on 3.x and reintroduces exactly the host/EE divergence this
+  # image exists to remove. Excluding the collections we do not use is the
+  # correct fix, and it makes the build markedly faster — azure-cli-core alone
+  # is a large dependency tree we would be compiling for nothing.
+  #
+  # ⚠️ These collections REMAIN IN THE IMAGE, just without their Python
+  # dependencies. Nothing in this workshop touches them. If a stretch goal ever
+  # does, it needs removing from this list, not adding back by hand.
+  #
+  # List taken from awx-ee's own execution-environment.yml on `devel` (the
+  # 24.6.1 image was built from it; the repo has no release branches). **Naming
+  # a collection that is not present is harmless** — the exclusion simply never
+  # matches — so an over-broad list is the safe direction to be wrong in.
+  exclude:
+    all_from_collections:
+      - amazon.aws
+      - ansible.posix
+      - ansible.windows
+      - awx.awx
+      - azure.azcollection
+      - community.vmware
+      - google.cloud
+      - kubernetes.core
+      - kubevirt.core
+      - openstack.cloud
+      - ovirt.ovirt
+      - redhatinsights.insights
+      - theforeman.foreman
+
+# Baking the collections in means AWX does NOT need to install them at project
+# sync time, which removes the Galaxy-credential trap (troubleshooting.md § 6)
+# and stops 60 stacks each hitting galaxy.ansible.com at session open.
+#
+# ✅ collections/requirements.yml carries exact `==` pins, measured from a built
+# image rather than chosen. Two builds a week apart (2026-09-02, 2026-09-09)
+# produced identical collection versions and identical image sizes.
+#
+# Re-measure after any deliberate bump and put the answer back in that file:
+#   docker run --rm -e HOME=/tmp --entrypoint ansible-galaxy workshop-ee:1.0.0 collection list
+#
+# ⚠️ The `exclude.all_from_collections` stanza above does NOT remove those
+# collections from the image — they ship inside the awx-ee base and stay there.
+# It excludes their
+# PYTHON REQUIREMENTS from dependency resolution, which is what the build needed:
+# introspect.py scans every baked-in collection, and azure.azcollection pulls in
+# azure-cli-core, which caps paramiko <4 and makes the resolve impossible.
+# A `collection list` against the built image therefore shows all 17. Expected.
+options:
+  package_manager_path: /usr/bin/dnf
+
+additional_build_steps:
+  append_final:
+    # The base image leaves `/usr/bin/python3` pointing at 3.9. Anything that
+    # shells out to a bare `python` — inside a collection, a module, or an
+    # attendee's stretch goal — would land on the wrong interpreter and fail to
+    # import ansible. Copied from upstream awx-ee, which does the same.
+    - RUN alternatives --install /usr/bin/python python /usr/bin/python3.12 312
+
+    # Fail the BUILD rather than the first job if the interpreter swap silently
+    # did not take. A wrong-Python EE otherwise looks fine until a lab runs.
+    - RUN /usr/bin/python3.12 -c "import ansible.release, sys; assert ansible.release.__version__ == '2.18.19', ansible.release.__version__; assert sys.version_info[:2] >= (3, 11)"
+    - RUN /usr/bin/python3.12 -c "import pynautobot, paramiko"

@@ -1,0 +1,53 @@
+# awx/awx.yml
+#
+# Every image is pinned to an exact tag or digest. Verified 2026-08-25 against
+# the awx-operator 2.19.1 CRD and the upstream registries.
+#
+#   kubectl apply -f awx/awx.yml
+#
+apiVersion: awx.ansible.com/v1beta1
+kind: AWX
+metadata:
+  name: awx
+  namespace: awx
+spec:
+  service_type: nodeport
+
+  # Static credentials, identical for every attendee.
+  # Create the secret first:
+  #   kubectl -n awx create secret generic awx-admin-password --from-literal=password=admin
+  admin_user: admin
+  admin_password_secret: awx-admin-password
+
+  # The AWX application itself.
+  #
+  # NOTE: the published quay.io/ansible/awx-operator:2.19.1 image bakes
+  # DEFAULT_AWX_VERSION=24.6.1 into its environment, so this already resolves
+  # to 24.6.1 without us. Pin it anyway — the manifest should say what it
+  # deploys rather than inherit it from someone else's image.
+  image: quay.io/ansible/awx
+  image_version: 24.6.1
+
+  # Execution environments. The operator's default ee_images list contains a
+  # literal `quay.io/ansible/awx-ee:latest` entry — replace the whole list.
+  control_plane_ee_image: quay.io/ansible/awx-ee:24.6.1
+  ee_images:
+    - name: AWX EE (24.6.1)
+      image: quay.io/ansible/awx-ee:24.6.1
+
+  init_container_image: quay.io/ansible/awx-ee
+  init_container_image_version: 24.6.1
+
+  # Operator default is quay.io/centos/centos:stream9, a rolling tag.
+  # Digest as of 2026-08-19.
+  init_projects_container_image: quay.io/centos/centos@sha256:64e5a212e4f2e7b706dbd822968914bb8def7de0a7fdfd3bf248241f8758101c
+
+  # Operator default is `latest`, and sclorg rebuilds this weekly.
+  # WARNING: changing this after the database exists is a Postgres upgrade,
+  # not a tag swap. Pin once, before the first apply, and leave it.
+  postgres_image: quay.io/sclorg/postgresql-15-c9s
+  postgres_image_version: "20260819"
+
+  # Operator default is `7`, which was repointed on 2026-08-25 to 7.4.11.
+  redis_image: docker.io/redis
+  redis_image_version: "7.4.11"

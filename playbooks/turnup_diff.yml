@@ -1,0 +1,167 @@
+---
+# Lab 4, node 1 of the `Site Turnup (gated)` workflow.
+#
+# WHAT THIS IS: the gate before the gate. A Nautobot webhook fires on ANY device
+# update, so the first thing the workflow does is ask Nautobot what is actually
+# true now and decide whether this event is worth acting on. Only then does it
+# render intent and diff it against the device — in check mode, always.
+#
+# 🔴 WHY IT RE-READS NAUTOBOT INSTEAD OF TRUSTING THE WEBHOOK PAYLOAD.
+#
+# Two reasons, and the second is the one that matters for the workshop.
+#
+# 1. Practical: the payload cannot be relied on to carry the status *name*.
+#    Nautobot serialises the changed object with `object_data_v2`, in which
+#    related objects appear as `{"id": ..., "object_type": ..., "url": ...}`
+#    with no human-readable name. Templating `{{ data.status.name }}` into the
+#    webhook body would render empty.
+#
+# 2. Correct: a webhook is a NOTIFICATION, not a source of truth. It says
+#    "something changed", and by the time the worker delivers it, it may already
+#    be stale — someone can flip the status twice in the time the queue takes.
+#    The automation asks the source of truth what is true now. That is the same
+#    argument the whole workshop makes, applied to itself.
+#
+# ⚠️ NAUTOBOT HAS NO WEBHOOK CONDITION FIELD. Unlike NetBox, Nautobot's Webhook
+# model (verified against 3.2.3 `nautobot/extras/models/models.py`) has no
+# `conditions` attribute — the fields are content_types, type_create/update/
+# delete, payload_url, http_method, http_content_type, additional_headers,
+# body_template, secret, ssl_verification, ca_file_path. So the filtering HAS to
+# live downstream. This play is where it lives.
+#
+# HOW TO RUN BY HAND (AWX normally supplies device_name and the limit):
+#   ansible-playbook -i inventory/nautobot.yml playbooks/turnup_diff.yml -u admin -k -e device_name=leaf1 --limit leaf1
+#
+# Verified against Nautobot 3.2.3 and AWX 24.6.1.
+
+# 🔴 `hosts: all`, NOT `hosts: localhost`. This play must be inside the limit.
+#
+# AWX launches this with `--limit leaf1` (the webhook passes the device that
+# changed). `--limit` applies to EVERY play in the playbook, so a play targeting
+# `localhost` matches nothing and Ansible prints:
+#
+#     PLAY [Decide whether this event is a site turn-up] ****
+#     skipping: no hosts matched
+#
+# and moves straight on. Observed 2026-09-02 on the first Lab 4 run.
+#
+# ⚠️ That is the worst possible failure for this playbook: the gate is SKIPPED,
+# not failed, so the workflow proceeds to the approval node having checked
+# nothing. An approval gate whose precondition silently does not run is worse
+# than no gate, because the record says it was checked.
+#
+# So the play targets `all` (inside the limit) and the work is done once, on the
+# controller, via `run_once` + `delegate_to: localhost` — which is also what
+# stops the API calls being attempted from the switch.
+- name: Decide whether this event is a site turn-up
+  hosts: all
+  gather_facts: false
+
+  vars:
+    nb_url: "{{ lookup('env', 'NAUTOBOT_URL') | default('http://localhost:8080', true) }}"
+    nb_token: "{{ lookup('env', 'NAUTOBOT_TOKEN') | default('0123456789abcdef0123456789abcdef01234567', true) }}"
+
+    # The status that means "this device is ready to be turned up". Anything
+    # else and the workflow stops here, before the approval node, so nobody is
+    # asked to approve a change that was never going to happen.
+    turnup_status: Active
+
+  tasks:
+    # One decision for the whole run, made on the controller. `run_once` because
+    # the answer does not vary per host; `delegate_to: localhost` because these
+    # are API calls and must not be attempted from a switch.
+    - name: Check the trigger
+      run_once: true
+      delegate_to: localhost
+      block:
+        - name: Fail clearly if the trigger did not name a device
+          ansible.builtin.assert:
+            that: device_name is defined and device_name | length > 0
+            fail_msg: >-
+              No device_name was supplied. This playbook is normally launched by
+              the Nautobot webhook, which passes it in extra_vars. To run it by
+              hand, add `-e device_name=leaf1`.
+
+        # depth=1 expands related objects one level, which is what turns
+        # `status` from a bare UUID reference into something with a readable
+        # name.
+        - name: Ask Nautobot what this device's status is NOW
+          ansible.builtin.uri:
+            url: "{{ nb_url }}/api/dcim/devices/?name={{ device_name | urlencode }}&depth=1"
+            method: GET
+            headers:
+              Authorization: "Token {{ nb_token }}"
+              Accept: application/json
+            status_code: 200
+          register: device_lookup
+
+        - name: Fail clearly if the device is not in Nautobot
+          ansible.builtin.assert:
+            that: (device_lookup.json.results | default([])) | length == 1
+            fail_msg: >-
+              Expected exactly one device named '{{ device_name }}' in Nautobot,
+              found {{ (device_lookup.json.results | default([])) | length }}.
+
+        # 🔴 LOOP BREAKER. Stop before anything else if this event was not a
+        # status change.
+        #
+        # Node 3 runs write_back.yml, which updates the device in Nautobot —
+        # and a device update fires the very webhook that started this
+        # workflow. Observed 2026-09-02: approve once and it never stops.
+        # Approve, apply, write back, new workflow, approve, apply, write back.
+        #
+        # Nautobot webhooks have no condition field, so this has to be decided
+        # here. The webhook passes `status_changed`, derived from
+        # `snapshots.differences.added`, which lists the fields that actually
+        # moved in this event. The write-back touches serial, software_version
+        # and two custom fields — never status — so the second workflow stops
+        # at this task, in seconds, without touching a device.
+        #
+        # `default('true')` so a manual launch with `-e device_name=...` still
+        # works: absent means "a human asked for this on purpose".
+        - name: Stop unless the status is what changed
+          ansible.builtin.assert:
+            that: status_changed | default('true') | bool
+            fail_msg: >-
+              This event changed {{ device_name }} but not its status, so it is
+              not a site turn-up and the workflow stops here. **This is the
+              expected result after a write-back** — node 3 updates the device,
+              which fires the same webhook again. Stopping here is what stops
+              that becoming a loop. Nothing was changed and nobody was asked to
+              approve anything.
+            success_msg: >-
+              The status changed in this event — this is a real trigger, not
+              an echo of our own write-back.
+
+        - name: Report the trigger
+          ansible.builtin.debug:
+            msg:
+              - "Device:          {{ device_name }}"
+              - "Status now:      {{ (device_lookup.json.results | first).status.name }}"
+              - "Changed by:      {{ changed_by | default('unknown') }}"
+              - "Nautobot event:  {{ nautobot_event | default('unknown') }} at {{ nautobot_timestamp | default('unknown') }}"
+              - "Request ID:      {{ nautobot_request_id | default('unknown') }}"
+
+        # A deliberate, explanatory failure. In the AWX visualizer this node
+        # goes red and the workflow ends — which is the correct outcome, and is
+        # what an unconditional webhook plus a downstream filter looks like.
+        - name: Stop unless this is a turn-up
+          ansible.builtin.assert:
+            that: (device_lookup.json.results | first).status.name == turnup_status
+            fail_msg: >-
+              {{ device_name }} is
+              '{{ (device_lookup.json.results | first).status.name }}', not
+              '{{ turnup_status }}' — so this edit is not a site turn-up and the
+              workflow stops here. Nothing was changed and nobody was asked to
+              approve anything. This is the expected result for any device edit
+              that is not a turn-up.
+            success_msg: >-
+              {{ device_name }} is {{ turnup_status }} — proceeding to render
+              intent and diff it against the device.
+
+# Reuses Lab 2's playbook rather than restating it. It defaults to check mode
+# (`apply: false`), so this node calculates the change without making it — which
+# is the whole point of putting it BEFORE the approval node. The approver reads
+# this node's output.
+- name: Render intent and diff it against the device
+  ansible.builtin.import_playbook: diff_intent.yml

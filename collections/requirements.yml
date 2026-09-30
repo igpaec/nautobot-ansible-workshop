@@ -1,0 +1,54 @@
+---
+# AWX installs these at project sync time — but ONLY if the Project's
+# Organization has a Galaxy credential attached. Check:
+#   Access → Organizations → Default → Galaxy Credentials
+# AWX ships an "Ansible Galaxy" credential that is often not attached by
+# default. Without it the sync succeeds, collections silently do not install,
+# and the job later fails with:
+#   couldn't resolve module/action 'arista.eos.eos_config'
+#
+# Phase 2 note: for 60 attendees, do NOT install collections at sync time.
+# Bake them into a custom execution environment with ansible-builder — same
+# reasoning as mirroring container images.
+
+# 🔴 EXACT PINS, NOT FLOORS — changed 2026-09-02.
+#
+# These were `>=` floors until the first execution environment was built, at
+# which point the problem became obvious: two builds on different days would
+# resolve different collection versions from identical inputs, producing two
+# different images that both claim to be workshop-ee:1.0.0. That is the same class
+# of failure as an unpinned container tag, one layer down — and this file is
+# read by BOTH the EE build and AWX's project sync, so a drift here shows up in
+# two places at once.
+#
+# Every version below was MEASURED from the built image on 2026-09-02, by
+# reading the MANIFEST.json of each installed collection. They are not
+# aspirational, and they are known to resolve together.
+#
+# To re-measure after a deliberate bump:
+#   docker run --rm -e HOME=/tmp --entrypoint ansible-galaxy workshop-ee:1.0.0 collection list
+
+collections:
+  - name: arista.eos
+    version: "==12.2.0"
+
+  # Not used in Stage 0, but present from the start so the EE/collection set
+  # does not change between stages. Lab 1 onward depends on it.
+  - name: networktocode.nautobot
+    version: "==6.2.0"
+
+  # A dependency of arista.eos, named here so the network_cli connection plugin
+  # version is decided by us rather than by whatever galaxy resolves that day.
+  #
+  # ⚠️ The old floor said `>=6.0.0` and was simply wrong — arista.eos 12.2.0
+  # requires >= 8.5.2, so a 6.x pin could never have resolved. The measured
+  # answer is 8.6.2.
+  - name: ansible.netcommon
+    version: "==8.6.2"
+
+  # Transitive under ansible.netcommon, and previously not named at all — so
+  # nothing in this project decided it. A transitive dependency is still a
+  # dependency; that is the whole lesson of the kube-rbac-proxy failure, where
+  # an unpinned image reference two levels down emptied out upstream.
+  - name: ansible.utils
+    version: "==6.1.0"

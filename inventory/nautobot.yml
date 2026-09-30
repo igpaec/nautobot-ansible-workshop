@@ -1,0 +1,117 @@
+---
+# Stage 1b — the Nautobot dynamic inventory that replaces static.ini.
+#   ⚠️ THIS FILE IS INTENTIONALLY EXECUTABLE (mode 755). Do not "fix" it.
+#   AWX will not offer a .yml file in its Inventory-file dropdown. From
+# awx/main/utils/ansible.py::could_be_inventory(), a candidate is accepted only
+# if it is named exactly `inventory`/`hosts`, ends in `.ini`, OR is executable —
+# any other extension is rejected outright. Which excludes every modern
+# plugin-based inventory, since they are all .yml.
+#   The exec bit is the least invasive way through: no rename, no restructure, and
+# git preserves the mode. Verified working.
+#   chmod +x inventory/nautobot.yml
+#   git update-index --chmod=+x inventory/nautobot.yml
+#   For the workshop itself, don't rely on this at all — pre-create both AWX
+# Inventories during provisioning and have attendees switch the Job Template's
+# Inventory field, which uses no file detection.
+#   HOW TO USE (locally):
+#   export NAUTOBOT_URL="http://localhost:8080"
+#   export NAUTOBOT_TOKEN="<token>"
+#   ansible-inventory -i inventory/nautobot.yml --graph
+#   ansible-inventory -i inventory/nautobot.yml --host leaf1
+#   Then the payoff — the SAME playbook, unchanged, against the new inventory:
+#   ansible-playbook -i inventory/nautobot.yml playbooks/configure_base.yml -u admin -k --check --diff
+#   NOTE: api_endpoint and token are deliberately NOT written here. Both options
+# read environment variables natively (NAUTOBOT_URL / NAUTOBOT_TOKEN), which
+# keeps the token out of git AND lets the same file work in two places: locally
+# it points at localhost, while in AWX a custom credential injects a URL that is
+# reachable from inside the cluster.
+
+plugin: networktocode.nautobot.inventory
+
+validate_certs: false
+
+# Pull Config Contexts into hostvars. Defaults to False — Lab 2 depends on this
+# being on, so it is enabled from the start.
+config_context: true
+
+# REQUIRED for Lab 2's payoff. Without this, the context arrives nested as a
+# `config_context` dict, so the template would have to say
+# `config_context.ntp_servers` — i.e. templates/base.j2 would have to CHANGE when
+# group_vars/leaf.yml is deleted, which destroys the "same playbook, same
+# template, nothing else changed" argument.
+#   With flatten on, the context keys land directly on the host, so `ntp_servers`
+# resolves exactly as it did from group_vars and the template is untouched.
+flatten_config_context: true
+
+# ---------------------------------------------------------------- group naming
+#   These two options together decide what the groups are CALLED, which decides
+# whether inventory/group_vars/leaf.yml still applies. Getting them wrong is the
+# most likely reason Lab 1 "works" but variables silently stop resolving.
+#   plurals: true (the DEFAULT) does two things you probably don't want:
+#   1. group_by choices must be plural (device_roles, locations, platforms)
+#   2. every hostvar is wrapped in a single-element array, for legacy
+#      compatibility with very old versions of this plugin
+# Setting it false gives modern, unwrapped hostvars and singular group_by names.
+plurals: false
+
+# group_names_raw: true drops the "role_" / "location_" prefix from group names,
+# so the role group is literally `leaf` rather than `role_leaf`.
+#   THIS IS WHAT KEEPS inventory/group_vars/leaf.yml WORKING. With the default
+# (false) the group would be `role_leaf`, group_vars/leaf.yml would match
+# nothing, and the play would fail its assert with no obvious cause.
+group_names_raw: true
+
+group_by:
+  - location
+  - role
+  - platform
+
+# ------------------------------------------------------------------- host vars
+#   compose values are Jinja2 EXPRESSIONS, not plain values.
+#   ONLY put things here that are genuinely DERIVED FROM NAUTOBOT. Connection
+# plumbing (ansible_connection / ansible_network_os / ansible_become) lives in
+# inventory/group_vars/all.yml instead.
+#   Learned the hard way: a bare YAML boolean here (`ansible_become: true`) does
+# not template reliably and is silently dropped. The only symptom is
+# "operation requires privilege escalation" from the first module needing enable
+# mode — every other connection var works, so it looks like anything but a
+# compose problem.
+compose:
+  # primary_ip4.address is CIDR ("172.20.20.3/24"); Ansible wants the bare
+  # address. Plain Jinja split avoids depending on ipaddr/netaddr.
+  ansible_host: primary_ip4.address.split('/')[0]
+
+# --------------------------------------------------------------- var renaming
+#   The plugin exposes a `tags` hostvar, which collides with Ansible's reserved
+# `tags` and produces:
+#   [WARNING]: Found variable using reserved name 'tags'
+# Harmless, but noisy and confusing in a workshop. Rename it out of the way.
+rename_variables:
+  - pattern: "^tags$"
+    repl: "nautobot_tags"
+
+# ---------------------------------------------------------------------- filters
+#   Restrict the inventory to Active devices only. Uncomment the two lines below
+# — remove the "# " from each — and nothing else needs changing.
+#   ⚠️ THE MAPPING FORM IS THE CORRECT ONE, and it is not what the option's type
+# suggests. `device_query_filters` is declared `elements: str`, which reads as if
+# entries were query-string fragments ("status=active"). They are not. The
+# plugin's validate_query_parameter() starts:
+#     if not (isinstance(parameter, dict) and len(parameter) == 1):
+#         self.display.warning("Warning query parameters %s not a dict ...")
+#         return None
+# A string is not a dict, so a string entry is DROPPED and every device still
+# appears — a silent no-op that looks like a working filter. The plugin's own
+# examples use the mapping form; the code agrees with the examples, not the type.
+#   ⚠️ AND THE VALUE IS CASE-SENSITIVE: `Active`, not `active`. Nautobot 3.x
+# filters status by the Status object's NAME, and a wrong case is not a silent
+# miss — the API returns
+#     {"status":["Select a valid choice. active is not one of the available choices."]}
+# which makes the whole inventory unparseable. Ansible then falls through to its
+# script, yaml and ini plugins, all of which also fail, so the LAST line printed
+# is "Unable to parse ... as an inventory source" — pointing at the file rather
+# than at the one wrong character. Read the `auto plugin` line, not the last one.
+#   Both corrected 2026-09-25, measured: the block previously showed the string
+# form, and then the lowercase value.
+# device_query_filters:
+#   - status: Active

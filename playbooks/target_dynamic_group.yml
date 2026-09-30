@@ -1,0 +1,90 @@
+---
+# Stage 1c — target a Nautobot Dynamic Group, without plugin support for it.
+#   THE PROBLEM: the networktocode.nautobot inventory plugin cannot expose Dynamic
+# Groups as inventory groups. Its `group_by` has a fixed choices list (location,
+# role, platform, tenant, rack, tag, status, cluster, device_type, manufacturer,
+# is_virtual, services) and dynamic groups are not among them. So you cannot set
+# a Job Template's Limit to a dynamic group name.
+#   THE APPROACH: resolve membership at runtime from Nautobot's REST API and build
+# an Ansible group from it with add_host. Nautobot still owns the definition of
+# "which devices" — change the filter in Nautobot and this play targets a
+# different set, with nothing edited in AWX.
+#   Verified present in Nautobot 3.2.2 source:
+#   /api/extras/dynamic-groups/<pk>/members/   (DynamicGroupViewSet.members)
+#   HOW TO RUN:
+#   export NAUTOBOT_URL="http://localhost:8080"
+#   export NAUTOBOT_TOKEN="<token>"
+#   ansible-playbook -i inventory/nautobot.yml playbooks/target_dynamic_group.yml -e dynamic_group_name="leaf-devices-dc1" -u admin -k
+#   NOTE ON add_host: because these hosts already exist in the Nautobot inventory,
+# add_host only adds them to a new group — it does NOT discard their hostvars.
+# ansible_host, config_context and everything else survive.
+
+- name: Resolve Dynamic Group membership into an Ansible group
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    dynamic_group_name: leaf-devices-dc1
+    target_group: dg_target
+    nb_headers:
+      Authorization: "Token {{ lookup('env', 'NAUTOBOT_TOKEN') }}"
+      Accept: application/json
+
+  tasks:
+    - name: Look up the Dynamic Group by name
+      ansible.builtin.uri:
+        url: >-
+          {{ lookup('env', 'NAUTOBOT_URL') }}/api/extras/dynamic-groups/?name={{ dynamic_group_name | urlencode }}
+        headers: "{{ nb_headers }}"
+        return_content: true
+      register: dg_lookup
+
+    - name: Fail clearly if the group does not exist
+      ansible.builtin.assert:
+        that: dg_lookup.json.count == 1
+        fail_msg: >-
+          Dynamic Group '{{ dynamic_group_name }}' not found (matched
+          {{ dg_lookup.json.count }}). Check Organization -> Dynamic Groups in
+          Nautobot, and that its content type is dcim.device.
+
+    - name: Fetch its members
+      # limit=0 disables pagination in Nautobot's API — returns every member.
+      ansible.builtin.uri:
+        url: >-
+          {{ lookup('env', 'NAUTOBOT_URL') }}/api/extras/dynamic-groups/{{ dg_lookup.json.results[0].id }}/members/?limit=0
+        headers: "{{ nb_headers }}"
+        return_content: true
+      register: dg_members
+
+    - name: Show what Nautobot says the target set is
+      ansible.builtin.debug:
+        msg: >-
+          '{{ dynamic_group_name }}' has {{ dg_members.json.results | length }}
+          member(s): {{ dg_members.json.results | map(attribute='name') | join(', ') }}
+
+    - name: Build the Ansible group from those members
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        groups: "{{ target_group }}"
+      loop: "{{ dg_members.json.results }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+- name: Act only on the Dynamic Group's members
+  hosts: dg_target
+  gather_facts: false
+
+  tasks:
+    - name: Prove targeting worked, and that hostvars survived add_host
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} ({{ ansible_host }}) — targeted via Nautobot
+          Dynamic Group membership.
+
+    # Swap this for the real work once targeting is confirmed:
+    #
+    # - name: Push base config
+    #   arista.eos.eos_config:
+    #     src: ../templates/base.j2

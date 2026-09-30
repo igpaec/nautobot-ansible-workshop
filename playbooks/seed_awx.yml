@@ -1,0 +1,909 @@
+---
+# Create every AWX object the labs need — the counterpart to seed_nautobot.yml.
+#
+# WHAT THIS IS: an ordinary playbook running against localhost, talking to AWX's
+# /api/v2/ through the awx.awx collection. It touches no devices and no Nautobot.
+#
+# HOW TO RUN:
+#   ansible-playbook playbooks/seed_awx.yml
+#
+# That is the whole command. No exports, no --extra-vars.
+#
+# 🔴 THIS PLAYBOOK DELIBERATELY DOES NOT REQUIRE CONTROLLER_* ENV VARS.
+#
+# An earlier revision asserted CONTROLLER_HOST / CONTROLLER_USERNAME /
+# CONTROLLER_PASSWORD were exported and failed the run if they were not. That
+# cost time twice, and it was the wrong design:
+#
+#   * The values are DETERMINISTIC. Every stack is http://localhost:8013 with
+#     admin/admin — see nautobot-ansible-workshop-instructor/00-credentials-and-addressing.md. The
+#     project's own rule is to hardcode static literals rather than look them
+#     up, and this file already hardcodes the Nautobot API token below.
+#   * Env vars are shell state. They vanish on a new SSH session, a `sudo -i`,
+#     a cron job, a systemd unit, or any non-interactive shell that skips
+#     .bashrc — every one of which provisioning will eventually run in (G2).
+#   * The failure was a bare assertion, which reads as "you did something
+#     wrong" rather than "AWX was never asked".
+#
+# The literals below are therefore DEFAULTS, and the CONTROLLER_* env vars
+# still override them if set. Exporting them remains fine; it is no longer
+# load-bearing.
+#
+# ⚠️ awx_url is localhost because this runs on the VM, alongside the
+# `kubectl port-forward`. That is NOT the address AWX jobs use to reach
+# Nautobot — see nautobot_url_from_pods below.
+#
+# IDEMPOTENT. Safe to re-run, and that is the point: this is the seed of
+# reset.sh (G5). Re-running restores every object to the state a lab expects.
+#
+# ORDER MATTERS, and awx.awx will not sort it out for you:
+#   credential_type -> credentials -> project -> inventories
+#   -> inventory_sources -> job_templates
+#
+# Covers Labs 0-3. Lab 4's workflow and approval node are G1 and are NOT here
+# yet; awx.awx has workflow_job_template and workflow_job_template_node ready
+# for when that lands.
+
+- name: Seed AWX with the workshop objects
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  # Applies these to every awx.awx module in the play. `controller` is an action
+  # group declared in the collection's meta/runtime.yml, and it covers every
+  # module used here — credential_type, credential, project, inventory,
+  # inventory_source, job_template, token, and the workflow_* modules Lab 4
+  # will need. One block instead of four arguments on fifteen tasks.
+  module_defaults:
+    group/awx.awx.controller:
+      controller_host: "{{ awx_url }}"
+      controller_username: "{{ awx_username }}"
+      controller_password: "{{ awx_password }}"
+      validate_certs: false
+
+  vars:
+    # Static literals, overridable by the env vars for anyone who prefers them.
+    # `| default(x, true)` — the second argument matters: it treats an EMPTY
+    # string as unset, which a bare `| default(x)` does not, and an unset env
+    # var comes back as "" not undefined.
+    awx_url: "{{ lookup('env', 'CONTROLLER_HOST') | default('http://localhost:8013', true) }}"
+    awx_username: "{{ lookup('env', 'CONTROLLER_USERNAME') | default('admin', true) }}"
+    awx_password: "{{ lookup('env', 'CONTROLLER_PASSWORD') | default('admin', true) }}"
+
+    org: Default
+    project_name: Nautobot Ansible Workshop
+    scm_url: https://github.com/igpaec/nautobot-ansible-workshop.git
+    scm_branch: main
+
+    # Built from ee/execution-environment.yml and loaded into minikube with
+    # `minikube -p awx image load`. No registry involved, so the tag must match
+    # what was loaded exactly — see 15-single-stack.md § 2b.
+    ee_name: workshop-ee
+    ee_image: "workshop-ee:1.0.0"
+
+    # 🔴 The URL AWX EXECUTION PODS use to reach Nautobot — not the one you use.
+    # AWX runs in Kubernetes; Nautobot is a plain container on the host. This is
+    # the minikube gateway, which is only stable because § 3 of 15-single-stack
+    # pins the subnet with --subnet=192.168.49.0/24. Assert it before trusting it:
+    #   minikube -p awx ssh -- ip route | grep default
+    nautobot_url_from_pods: http://192.168.49.1:8080
+    nautobot_token: "0123456789abcdef0123456789abcdef01234567"
+
+    # Nautobot as seen from THIS playbook, running on the VM. Different from
+    # nautobot_url_from_pods above, and different again from the address AWX
+    # has in Nautobot's webhook (host.docker.internal). Three names for one
+    # service, and which one is correct depends entirely on who is asking.
+    nautobot_url_local: "{{ lookup('env', 'NAUTOBOT_URL') | default('http://localhost:8080', true) }}"
+
+    # 🔴 The address NAUTOBOT'S CELERY WORKER uses to reach AWX — the same one
+    # Lab 3's Job Button uses, and for the same reason. Never a bridge-gateway
+    # literal: those depend on Docker network creation order and would differ
+    # between stacks. See troubleshooting.md § 8.
+    awx_url_from_nautobot: http://host.docker.internal:8013
+
+    device_username: admin
+    device_password: admin
+
+  tasks:
+    # Pre-flight against the thing that ACTUALLY breaks. Credentials are static,
+    # so they are never the problem; the port-forward is, constantly. It is a
+    # foreground process that dies on SSH disconnect and on reboot, and without
+    # it every awx.awx task below fails with a connection error that names the
+    # module rather than the cause.
+    #
+    # /api/v2/ping/ is unauthenticated, so a 200 proves reachability alone. The
+    # first real module call is what proves the password.
+    - name: Check AWX is reachable before doing anything else
+      ansible.builtin.uri:
+        url: "{{ awx_url }}/api/v2/ping/"
+        method: GET
+        validate_certs: false
+        timeout: 10
+      register: awx_ping
+      failed_when: false
+      changed_when: false
+
+    - name: Explain it if AWX is not answering
+      ansible.builtin.assert:
+        that: awx_ping.status == 200
+        fail_msg: >-
+          No answer from AWX at {{ awx_url }} (got {{ awx_ping.status }}).
+          Almost always the port-forward: it is a foreground process and does
+          not survive a reboot or an SSH disconnect. Restart it with
+          `nohup kubectl -n awx port-forward --address 0.0.0.0 svc/awx-service 8013:80 > /tmp/awx-port-forward.log 2>&1 &`
+          then re-run this playbook.
+        success_msg: "AWX {{ awx_ping.json.version | default('?') }} answering at {{ awx_url }}"
+
+    # ------------------------------------------------- custom credential type
+    # Input configuration = the form fields. Injector = how they reach the job.
+    #
+    # This is what lets inventory/nautobot.yml hardcode neither URL nor token:
+    # the plugin's api_endpoint and token options read NAUTOBOT_URL and
+    # NAUTOBOT_TOKEN from the environment natively, and this injector puts them
+    # there at runtime. Same file therefore works locally and inside AWX.
+    - name: Credential type — Nautobot API
+      awx.awx.credential_type:
+        name: Nautobot API
+        kind: cloud
+        description: >-
+          Injects NAUTOBOT_URL and NAUTOBOT_TOKEN into a job's environment.
+        inputs:
+          fields:
+            - id: nautobot_url
+              type: string
+              label: Nautobot URL
+            - id: nautobot_token
+              type: string
+              label: Nautobot Token
+              secret: true
+          required:
+            - nautobot_url
+            - nautobot_token
+        injectors:
+          env:
+            NAUTOBOT_URL: "{% raw %}{{ nautobot_url }}{% endraw %}"
+            NAUTOBOT_TOKEN: "{% raw %}{{ nautobot_token }}{% endraw %}"
+        state: present
+
+    # {% raw %} above is essential. Those braces are AWX's OWN templating over
+    # the field ids, evaluated by AWX at job launch. Without raw, Ansible would
+    # try to resolve them here and write empty strings into the injector.
+
+    # ------------------------------------------------------------ credentials
+    - name: Credential — Nautobot API
+      awx.awx.credential:
+        name: Nautobot API
+        organization: "{{ org }}"
+        credential_type: Nautobot API
+        inputs:
+          nautobot_url: "{{ nautobot_url_from_pods }}"
+          nautobot_token: "{{ nautobot_token }}"
+        state: present
+
+    - name: Credential — cEOS admin
+      awx.awx.credential:
+        name: cEOS admin
+        organization: "{{ org }}"
+        credential_type: Machine
+        inputs:
+          username: "{{ device_username }}"
+          password: "{{ device_password }}"
+          become_method: enable
+        state: present
+
+    # ----------------------------------------------- execution environment
+    # 🔴 THE STOCK EE CANNOT RUN THIS WORKSHOP. Measured 2026-09-02:
+    # quay.io/ansible/awx-ee:24.6.1 ships ansible-core 2.15.12, but
+    # networktocode.nautobot needs >= 2.17.0 and arista.eos needs >= 2.16.0,
+    # and neither pynautobot nor paramiko is present. See ee/execution-environment.yml.
+    #
+    # ⚠️ `pull: missing` IS REQUIRED for a locally built image. The default is
+    # already `missing`, but stating it here is deliberate: `always` would make
+    # AWX try to fetch workshop-ee from a registry that has never heard of it, and
+    # the failure is an image-pull error that says nothing about why.
+    # AWX will happily register an EE whose image does not exist. The failure
+    # then surfaces much later, as ImagePullBackOff on the first job, which
+    # reads like a network problem rather than a missing build step.
+    - name: Check the custom EE image is loaded into minikube
+      ansible.builtin.command: minikube -p awx image ls
+      register: mk_images
+      changed_when: false
+      failed_when: false
+
+    - name: Explain it if the EE image was never built or loaded
+      ansible.builtin.assert:
+        that: ee_image in (mk_images.stdout | default(''))
+        fail_msg: >-
+          {{ ee_image }} is not loaded into the awx minikube profile, so every
+          job would fail with ImagePullBackOff. Build and load it:
+          `/opt/ansible/bin/pip install ansible-builder==3.1.1` then
+          `cd ~/nautobot-ansible-workshop/ee && /opt/ansible/bin/ansible-builder build --tag {{ ee_image }} --container-runtime docker`
+          then `minikube -p awx image load {{ ee_image }}`.
+          See 15-single-stack.md section 2b.
+        success_msg: "{{ ee_image }} is present in the awx minikube profile."
+
+    - name: Execution environment — workshop-ee
+      awx.awx.execution_environment:
+        name: "{{ ee_name }}"
+        image: "{{ ee_image }}"
+        organization: "{{ org }}"
+        pull: missing
+        state: present
+
+    # ---------------------------------------------------------------- project
+    # default_environment sets it in ONE place rather than on every job
+    # template. AWX resolves an EE as: job template -> project -> organization
+    # -> global default, so the project is the narrowest place that covers all
+    # of this workshop's templates without touching anything else on the
+    # instance.
+    - name: Project — Nautobot Ansible Workshop
+      awx.awx.project:
+        name: "{{ project_name }}"
+        organization: "{{ org }}"
+        scm_type: git
+        scm_url: "{{ scm_url }}"
+        scm_branch: "{{ scm_branch }}"
+        scm_update_on_launch: true
+        scm_clean: true
+        default_environment: "{{ ee_name }}"
+        wait: true
+        state: present
+
+    # 🔴 SYNC BEFORE CREATING JOB TEMPLATES. This is not belt-and-braces.
+    #
+    # `awx.awx.job_template` validates `playbook` against AWX's cached list of
+    # files from the project's LAST SUCCESSFUL SYNC, and refuses with:
+    #
+    #     Unable to create job_template <name>: {'playbook': ['Playbook not found for project.']}
+    #
+    # `wait: true` on the project task above only waits for the sync that
+    # happens when the project is CREATED. On every later run the project is
+    # unchanged, so no sync is triggered and AWX's file list is whatever it was
+    # — which means any playbook added to the repo since then does not exist as
+    # far as job_template validation is concerned.
+    #
+    # Hit 2026-09-02 adding Lab 4: turnup_diff.yml was pushed and pulled, the
+    # playbook was visibly present in the repo on the VM, and AWX still said it
+    # was not there. AWX was right — it had never looked.
+    #
+    # `scm_update_on_launch: true` does not help either: that syncs when a JOB
+    # launches, and this failure happens at TEMPLATE CREATION time, before any
+    # job exists.
+    #
+    # `wait: true` here so the sync has finished before the next task runs; the
+    # module reports not-changed when the SCM revision is unmoved, so this is
+    # cheap on a re-run.
+    - name: Sync the project so AWX can see any newly added playbooks
+      awx.awx.project_update:
+        project: "{{ project_name }}"
+        organization: "{{ org }}"
+        wait: true
+        timeout: 300
+
+    # ------------------------------------------------------------ inventories
+    # BOTH are pre-created on purpose. Lab 1's payoff is the attendee changing
+    # the Job Template's Inventory field from one to the other — a plain object
+    # dropdown. They must NOT be asked to pick an inventory *file*: AWX's
+    # could_be_inventory() only offers .ini, executables, or files named exactly
+    # inventory/hosts, so a .yml plugin config may not appear at all.
+    - name: Inventory — Static (Lab 0)
+      awx.awx.inventory:
+        name: Static (Lab 0)
+        organization: "{{ org }}"
+        description: The hand-maintained inventory the cold open throws away.
+        state: present
+
+    - name: Inventory — Nautobot (Lab 1)
+      awx.awx.inventory:
+        name: Nautobot (Lab 1)
+        organization: "{{ org }}"
+        description: Sourced from Nautobot. Same playbook, no static file.
+        state: present
+
+    - name: Inventory source — static.ini
+      awx.awx.inventory_source:
+        name: static.ini
+        inventory: Static (Lab 0)
+        source: scm
+        source_project: "{{ project_name }}"
+        source_path: inventory/static.ini
+        overwrite: true
+        update_on_launch: true
+        state: present
+
+    # The Nautobot credential is attached HERE so the inventory plugin gets
+    # NAUTOBOT_URL / NAUTOBOT_TOKEN during the sync.
+    - name: Inventory source — nautobot.yml
+      awx.awx.inventory_source:
+        name: nautobot.yml
+        inventory: Nautobot (Lab 1)
+        source: scm
+        source_project: "{{ project_name }}"
+        source_path: inventory/nautobot.yml
+        credential: Nautobot API
+        overwrite: true
+        update_on_launch: true
+        state: present
+
+    # 🔴 SYNC IT NOW — do not rely on `update_on_launch`.
+    #
+    # Found 2026-09-24. Creating the source is not the same as populating it:
+    # `update_on_launch` only fires when a job runs against the inventory, so a
+    # freshly provisioned stack shows **Nautobot (Lab 1) with zero hosts** until
+    # somebody launches something or clicks Sync.
+    #
+    # Two reasons that is wrong rather than merely untidy:
+    #
+    #   1. `reset_lab.yml` DOES sync it, with the comment "Lab 1's payoff is
+    #      watching the Nautobot inventory populate ... the lab's first check
+    #      looks broken for a reason that has nothing to do with the attendee".
+    #      So reset restored the stack to a BETTER state than provisioning left
+    #      it in — backwards, and it means a reset silently fixes a defect
+    #      nobody knew was there.
+    #
+    #   2. At 60 stacks the first sync would happen 60 times during the session
+    #      rather than once during provisioning, against one Nautobot each.
+    #      Cheap here, and exactly the sort of thing not to discover on the day.
+    - name: Sync the Nautobot inventory source
+      awx.awx.inventory_source_update:
+        name: nautobot.yml
+        inventory: Nautobot (Lab 1)
+        organization: "{{ org }}"
+        wait: true
+        timeout: 120
+
+    # --------------------------------------------------------- job templates
+    # Lab 0. The survey is the villain of the cold open: six facts Nautobot
+    # already holds, retyped by a human, with no validation and no history.
+    #
+    # 🔴 F14 CLOSED 2026-09-24 — THE SURVEY FIELDS ARE DELIBERATELY EMPTY.
+    #
+    # There are no `default:` keys below, and adding any back breaks the lab.
+    #
+    # Pre-filled fields let an attendee click Launch without typing anything,
+    # which deletes the entire point of the cold open. The lab exists to make
+    # retyping six known-good facts feel tedious, and to leave room for a typo
+    # that nothing catches — that unvalidated typo is what Lab 2's Config
+    # Context Schema later prevents. A pre-filled form makes the "before" state
+    # look fine, and the whole four hours argue that it is not.
+    #
+    # The values stay printed in the attendee guide
+    # (nautobot-ansible-workshop-guide/lab0-cold-open.md) so nobody has to hunt
+    # for them. They just must not arrive already entered.
+    #
+    # ⚠️ `required: true` is doing the work now. With no default and a required
+    # field, AWX refuses to launch until all six are filled — so the friction is
+    # enforced rather than merely encouraged.
+    #
+    # Do not "helpfully" re-add the defaults.
+    - name: Job template — Onboard Site (survey)
+      awx.awx.job_template:
+        name: Onboard Site (survey)
+        organization: "{{ org }}"
+        project: "{{ project_name }}"
+        playbook: playbooks/configure_base.yml
+        inventory: Static (Lab 0)
+        credentials:
+          - cEOS admin
+        become_enabled: true
+        survey_enabled: true
+        survey_spec:
+          name: ""
+          description: Every field here is a fact Nautobot already knows.
+          spec:
+            - question_name: Site name
+              variable: site_name
+              type: text
+              required: true
+            - question_name: Primary NTP server
+              variable: ntp_primary
+              type: text
+              required: true
+            - question_name: Secondary NTP server
+              variable: ntp_secondary
+              type: text
+              required: true
+            - question_name: SNMP community
+              variable: snmp_community
+              type: text
+              required: true
+            - question_name: DNS server
+              variable: dns_server
+              type: text
+              required: true
+            - question_name: Syslog host
+              variable: syslog_host
+              type: text
+              required: true
+        state: present
+
+    # 🔴 NO ask_inventory_on_launch. Removed 2026-09-24, and it must not come back.
+    #
+    # It used to be set here, with the note "this is what makes Lab 1 a dropdown
+    # change rather than an edit". That was wrong on two counts.
+    #
+    # 1. IT BREAKS THE LAB. Lab 1e has the attendee **Edit** the template, change
+    #    Inventory to "Nautobot (Lab 1)", and Save. With a launch-time prompt they
+    #    can pick it in the launch dialog instead and never open the template —
+    #    which is the one deliberate act the whole lab is built around.
+    #
+    # 2. IT BREAKS LABS 2-4. A launch-time choice is per-run and not persisted:
+    #    the template still says "Static (Lab 0)" afterwards. Every later lab
+    #    would quietly run against the static inventory, and nothing would say so.
+    #
+    # The Inventory field on the template is the single place that decides, which
+    # is also what reset_lab.yml relies on when it sets the inventory per lab.
+    #
+    # ⚠️ The other ask_* flags below are unrelated and ARE required:
+    # ask_variables_on_launch for the Job Button's and webhook's extra_vars, and
+    # ask_limit_on_launch for the webhook's `limit`. Do not remove those.
+
+    # Lab 1c. A survey that is NOT a duplicate of the source of truth: it asks
+    # which set to act on, which is a human decision Nautobot cannot make.
+    # Multiple choice rather than text — attendees pick, so there is no typo class.
+    - name: Job template — Configure Dynamic Group members
+      awx.awx.job_template:
+        name: Configure Dynamic Group members
+        organization: "{{ org }}"
+        project: "{{ project_name }}"
+        playbook: playbooks/target_dynamic_group.yml
+        inventory: Nautobot (Lab 1)
+        credentials:
+          - cEOS admin
+          - Nautobot API
+        become_enabled: true
+        survey_enabled: true
+        survey_spec:
+          name: ""
+          description: ""
+          spec:
+            - question_name: Which Nautobot Dynamic Group should this target?
+              variable: dynamic_group_name
+              type: multiplechoice
+              choices:
+                - leaf-devices-dc1
+              default: leaf-devices-dc1
+              required: true
+        state: present
+
+    # Lab 2. Reads Nautobot only — no device credential, so it runs even with
+    # the switches powered off.
+    - name: Job template — Render intent
+      awx.awx.job_template:
+        name: Render intent
+        organization: "{{ org }}"
+        project: "{{ project_name }}"
+        playbook: playbooks/render_intent.yml
+        inventory: Nautobot (Lab 1)
+        credentials:
+          - Nautobot API
+        state: present
+
+    - name: Job template — Diff intent vs device
+      awx.awx.job_template:
+        name: Diff intent vs device
+        organization: "{{ org }}"
+        project: "{{ project_name }}"
+        playbook: playbooks/diff_intent.yml
+        inventory: Nautobot (Lab 1)
+        credentials:
+          - cEOS admin
+          - Nautobot API
+        become_enabled: true
+        state: present
+
+    # Lab 3. ask_variables_on_launch is REQUIRED: the Nautobot Job Button POSTs
+    # extra_vars (device_name, device_id, device_location) and AWX silently
+    # discards them unless the template accepts prompted variables.
+    - name: Job template — Write back to Nautobot
+      awx.awx.job_template:
+        name: Write back to Nautobot
+        organization: "{{ org }}"
+        project: "{{ project_name }}"
+        playbook: playbooks/write_back.yml
+        inventory: Nautobot (Lab 1)
+        credentials:
+          - cEOS admin
+          - Nautobot API
+        become_enabled: true
+        ask_variables_on_launch: true
+        state: present
+
+    # ------------------------------------------------- Lab 4: the gated workflow
+    # Two job templates and a three-node workflow. The workflow is what the
+    # Nautobot webhook launches.
+    #
+    # ask_variables_on_launch AND ask_limit_on_launch are required on BOTH job
+    # templates and on the workflow. AWX drops prompted values at every level
+    # that has not opted in, silently — so a workflow that accepts a limit but
+    # whose nodes do not will run against the whole inventory and report
+    # success. Both flags, everywhere, or the behaviour is wrong rather than
+    # broken.
+    - name: Job template — Site Turnup check and diff
+      awx.awx.job_template:
+        name: Site Turnup - check and diff
+        description: >-
+          Lab 4 node 1. Re-reads the device's status from Nautobot, stops if it
+          is not Active, then renders intent and diffs it in check mode. Runs
+          BEFORE the approval node so the approver has a diff to read.
+        organization: "{{ org }}"
+        project: "{{ project_name }}"
+        playbook: playbooks/turnup_diff.yml
+        inventory: Nautobot (Lab 1)
+        credentials:
+          - cEOS admin
+          - Nautobot API
+        become_enabled: true
+        ask_variables_on_launch: true
+        ask_limit_on_launch: true
+        state: present
+
+    # 🔴 apply: true lives HERE, not in the playbook. turnup_apply.yml imports
+    # the same diff_intent.yml that node 1 runs, which defaults to check mode.
+    # Job template extra_vars override play vars, so this one flag is the entire
+    # difference between "show me" and "do it" — and it guarantees the approver
+    # saw the change that gets made, because it is literally the same code path.
+    - name: Job template — Site Turnup apply and write back
+      awx.awx.job_template:
+        name: Site Turnup - apply and write back
+        description: >-
+          Lab 4 node 3. Applies the configuration the approver saw, then writes
+          discovered state back to Nautobot. Only runs if the approval node was
+          approved.
+        organization: "{{ org }}"
+        project: "{{ project_name }}"
+        playbook: playbooks/turnup_apply.yml
+        inventory: Nautobot (Lab 1)
+        credentials:
+          - cEOS admin
+          - Nautobot API
+        become_enabled: true
+        extra_vars:
+          apply: true
+        ask_variables_on_launch: true
+        ask_limit_on_launch: true
+        state: present
+
+    - name: Workflow — Site Turnup (gated)
+      awx.awx.workflow_job_template:
+        name: Site Turnup (gated)
+        description: >-
+          Lab 4. Launched by the Nautobot webhook when a device is updated.
+          Checks the trigger, diffs, waits for a human, then applies.
+        organization: "{{ org }}"
+        inventory: Nautobot (Lab 1)
+        ask_variables_on_launch: true
+        ask_limit_on_launch: true
+        state: present
+      register: wfjt
+
+    # ⚠️ NODES FIRST, LINKS SECOND — two passes, not one.
+    # A node cannot reference a sibling that does not exist yet, so success_nodes
+    # is set in a second pass once all three identifiers are known. This is the
+    # pattern in the collection's own documentation for approval workflows.
+    - name: Workflow node 1 — check and diff
+      awx.awx.workflow_job_template_node:
+        identifier: turnup-check
+        workflow_job_template: Site Turnup (gated)
+        organization: "{{ org }}"
+        unified_job_template: Site Turnup - check and diff
+        state: present
+
+    # The only node that runs no code. `timeout: 0` means it waits indefinitely
+    # — deliberate for a lab, where an attendee may take a while to get here.
+    # Lab 4's stretch goal asks them to set a real timeout and watch it expire.
+    - name: Workflow node 2 — the approval gate
+      awx.awx.workflow_job_template_node:
+        identifier: turnup-approval
+        workflow_job_template: Site Turnup (gated)
+        organization: "{{ org }}"
+        approval_node:
+          name: Approve site turn-up
+          description: >-
+            Read node 1's diff before approving. Approving applies that
+            configuration to the device and writes state back to Nautobot.
+          timeout: 0
+        state: present
+
+    - name: Workflow node 3 — apply and write back
+      awx.awx.workflow_job_template_node:
+        identifier: turnup-apply
+        workflow_job_template: Site Turnup (gated)
+        organization: "{{ org }}"
+        unified_job_template: Site Turnup - apply and write back
+        state: present
+
+    # success_nodes, not always_nodes. If node 1 decides this was not a turn-up,
+    # or the diff fails, nobody is asked to approve anything.
+    - name: Link check → approval
+      awx.awx.workflow_job_template_node:
+        identifier: turnup-check
+        workflow_job_template: Site Turnup (gated)
+        organization: "{{ org }}"
+        success_nodes:
+          - turnup-approval
+        state: present
+
+    # An approval node "succeeds" when approved and "fails" when denied or timed
+    # out, so success_nodes here is exactly "only if a human said yes".
+    - name: Link approval → apply
+      awx.awx.workflow_job_template_node:
+        identifier: turnup-approval
+        workflow_job_template: Site Turnup (gated)
+        organization: "{{ org }}"
+        success_nodes:
+          - turnup-apply
+        state: present
+
+    # --------------------------------------------- OAuth2 token (Labs 3 and 4)
+    # 🔴 THE ONE CREDENTIAL THAT CANNOT BE PINNED. Everything else in this
+    # workshop is declarative — both admin passwords and the Nautobot API token
+    # are literals in config files. AWX generates this one, so it has to be
+    # created and then carried to Nautobot, which is the single imperative step
+    # in provisioning.
+    #
+    # Nautobot's Job Button (Lab 3) and webhook (Lab 4) both authenticate to AWX
+    # with it.
+    #
+    # ⚠️ THIS TASK IS NOT IDEMPOTENT, and it cannot easily be made so.
+    #
+    # The token value is returned only at creation — AWX never shows it again.
+    # So the module always creates, and re-running this playbook mints another
+    # token while the previous one keeps working. Tokens accumulate.
+    #
+    # `state: absent` is no help: it requires existing_token or
+    # existing_token_id, and there is no list-tokens module to find them with.
+    # Cleaning up means the AWX UI (Administration -> Users -> admin -> Tokens)
+    # or the /api/v2/tokens/ endpoint.
+    #
+    # Harmless on a lab stack. Worth solving in reset.sh (G5), which will want
+    # to revoke and reissue rather than pile up.
+    - name: Create the AWX token for Nautobot
+      awx.awx.token:
+        description: nautobot-ansible-workshop
+        scope: write
+        state: present
+      register: awx_token
+
+    # -------------------------------------------- Lab 4: the Nautobot webhook
+    # 🔴 THIS IS A NAUTOBOT OBJECT CREATED BY THE AWX SEED, AND THAT IS ON
+    # PURPOSE. It needs two things that only exist once AWX has been seeded:
+    # the workflow's numeric id, and the OAuth2 token to authenticate with.
+    # Putting it in seed_nautobot.yml would mean running that playbook twice.
+    #
+    # There is no `webhook` module in networktocode.nautobot (checked against
+    # the collection's module list), so this is the REST API — the same
+    # look-then-POST-or-PATCH shape used for Config Contexts and the Git
+    # Repository in seed_nautobot.yml.
+    #
+    # ⚠️ ORDER: THIS BLOCK RUNS *BEFORE* THE CONTAINER RESTART BELOW.
+    #
+    # An earlier revision put it after, and it failed on the first Lab 4 run
+    # with `Connection reset by peer` against localhost:8080. The restart task
+    # had returned, but `invoke start` only waits for containers to be created —
+    # Django takes another 30-60s to start serving, and in between the port is
+    # bound by the docker proxy and nothing answers it. The worker env check is
+    # no guard: it is a `docker exec`, which succeeds long before HTTP does.
+    #
+    # Nothing here needs the restart. The token and the workflow id are both in
+    # memory already, and Nautobot is still up and serving at this point. So the
+    # fix is ordering, not waiting.
+    - name: Look for an existing device-status webhook
+      ansible.builtin.uri:
+        url: "{{ nautobot_url_local }}/api/extras/webhooks/?name=device-status-change"
+        method: GET
+        headers: &nb_hdrs
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: application/json
+          Content-Type: application/json
+        status_code: 200
+      register: webhook_lookup
+      # Cheap insurance for the general case — Nautobot mid-restart from some
+      # earlier step, or still migrating. Not a substitute for the ordering above.
+      retries: 12
+      delay: 10
+      until: webhook_lookup is succeeded
+
+    # 🔴 `!unsafe` IS LOAD-BEARING, AND `{% raw %}` IS NOT ENOUGH HERE.
+    #
+    # body_template is a Jinja2 template that NAUTOBOT renders, at webhook-send
+    # time, against its own context: event, timestamp, model, username,
+    # request_id, data, snapshots (verified in nautobot/extras/tasks.py,
+    # process_webhook). Every `{{ ... }}` below must reach Nautobot untouched.
+    #
+    # The first attempt used `{% raw %}`, the same guard as the credential
+    # injector above, and it failed in two stacked ways:
+    #
+    #   1. `{% raw %}` protects exactly ONE render pass. set_fact renders it,
+    #      producing a real string full of live `{{ }}` — and then this task's
+    #      output is consumed by a LATER task, which templates its arguments
+    #      recursively and evaluates them for real:
+    #          "The task includes an option with an undefined variable ...
+    #           'data' is undefined"
+    #      `data` is Nautobot's, not Ansible's, so there is nothing to resolve.
+    #
+    #   2. Worse and quieter: the rendered string looks like a Python dict
+    #      literal, so Ansible literal_eval'd it and body_template became a
+    #      DICT. Even with the templating fixed, Nautobot's API expects a
+    #      string there and would have rejected it.
+    #
+    # `!unsafe` fixes both at once. It marks the scalar as AnsibleUnsafeText,
+    # which the templar refuses to render at any depth or in any later task —
+    # so no `{% raw %}` is needed, and no type conversion happens because no
+    # templating happens. The value stays the exact string written here.
+    #
+    # RULE: `{% raw %}` for a value used in the SAME task; `!unsafe` for a value
+    # that passes through a variable. The injector above is the first case; this
+    # is the second.
+    #
+    # 🔴 `status_changed` BREAKS A FEEDBACK LOOP. Do not remove it.
+    #
+    # Observed 2026-09-02: approving the workflow ran node 3, node 3 ran
+    # write_back.yml, write_back.yml UPDATED THE DEVICE — and a device update is
+    # exactly what this webhook fires on. So a second workflow launched, asked
+    # for approval, wrote back again, and launched a third. Approve once and it
+    # never stops.
+    #
+    #   status -> Active --> webhook --> workflow --> approve --> write_back
+    #                 ^                                               |
+    #                 +-------------- device updated -----------------+
+    #
+    # Nautobot has no webhook condition field, so the webhook cannot be told to
+    # care only about status. But the payload knows which fields moved:
+    # `snapshots.differences.added` is keyed by the field names that actually
+    # changed in this event (verified in nautobot/extras/models/change_logging.py,
+    # get_snapshots). The write-back touches serial, software_version and two
+    # custom fields — never status.
+    #
+    # turnup_diff.yml stops the workflow when this is false, so the loop ends
+    # one short, device-free run after the real one.
+    #
+    # `limit` targets the workflow at the one device that changed. Both the
+    # workflow and its two job templates set ask_limit_on_launch, without which
+    # AWX accepts the field and ignores it.
+    #
+    # We deliberately do NOT send the status. `data` is object_data_v2, in which
+    # related objects carry only id/object_type/url — no name — so the status
+    # would render empty. turnup_diff.yml re-reads it from Nautobot instead,
+    # which is both more reliable and the more honest lesson.
+    - name: Build the webhook definition
+      ansible.builtin.set_fact:
+        webhook_body:
+          name: device-status-change
+          content_types:
+            - dcim.device
+          type_create: false
+          type_update: true
+          type_delete: false
+          enabled: true
+          payload_url: "{{ awx_url_from_nautobot }}/api/v2/workflow_job_templates/{{ wfjt.id }}/launch/"
+          http_method: POST
+          http_content_type: application/json
+          additional_headers: "Authorization: Bearer {{ awx_token.ansible_facts.controller_token.token }}"
+          ssl_verification: false
+          body_template: !unsafe |
+            {
+              "extra_vars": {
+                "device_name": "{{ data.name }}",
+                "device_id": "{{ data.id }}",
+                "nautobot_event": "{{ event }}",
+                "nautobot_timestamp": "{{ timestamp }}",
+                "nautobot_request_id": "{{ request_id }}",
+                "changed_by": "{{ username }}",
+                "status_changed": "{{ 'status' in ((snapshots or {}).get('differences') or {}).get('added', {}) }}"
+              },
+              "limit": "{{ data.name }}"
+            }
+
+    # Cheap guard against the failure mode above coming back. If body_template
+    # is ever a dict again, the API call would fail with a 400 that names a
+    # serializer field rather than the templating that caused it.
+    - name: Confirm the body template survived as an unrendered string
+      ansible.builtin.assert:
+        that:
+          - webhook_body.body_template is string
+          - "'data.name' in webhook_body.body_template"
+        fail_msg: >-
+          body_template was templated or type-converted before reaching
+          Nautobot. The `!unsafe` tag on it has been lost.
+        success_msg: body_template is an unrendered string, as Nautobot needs.
+
+    - name: Create the webhook
+      ansible.builtin.uri:
+        url: "{{ nautobot_url_local }}/api/extras/webhooks/"
+        method: POST
+        headers: *nb_hdrs
+        body_format: json
+        body: "{{ webhook_body }}"
+        status_code: 201
+      when: (webhook_lookup.json.results | default([])) | length == 0
+
+    # PATCH rather than skip: the token is new on every run, so an existing
+    # webhook is carrying a stale Authorization header and would get a 401 from
+    # AWX. That failure is invisible from Nautobot — the change log records the
+    # device edit and nothing says the webhook was rejected.
+    - name: Update the existing webhook with the current token and workflow id
+      ansible.builtin.uri:
+        url: "{{ nautobot_url_local }}/api/extras/webhooks/{{ (webhook_lookup.json.results | first).id }}/"
+        method: PATCH
+        headers: *nb_hdrs
+        body_format: json
+        body: "{{ webhook_body }}"
+        status_code: 200
+      when: (webhook_lookup.json.results | default([])) | length == 1
+
+
+    # 🔴 IT MUST GO IN creds.env — NOT A NEW FILE.
+    #
+    # An earlier revision wrote environments/awx.env and told the operator to
+    # wire it into docker-compose.local.yml by hand. That manual step is easy to
+    # skip, and skipping it fails LATE and CONFUSINGLY: provisioning is green,
+    # the Job Button renders, and only on click does the Job Result say
+    # "AWX_HOST and AWX_TOKEN must be set on the Nautobot worker."
+    #
+    # nautobot-docker-compose loads exactly two env files, in
+    # environments/docker-compose.base.yml:
+    #
+    #     x-nautobot-base: &nautobot-base
+    #       env_file:
+    #         - "local.env"
+    #         - "creds.env"
+    #
+    # and `nautobot`, `celery_worker` and `celery_beat` all merge that anchor.
+    # So anything written to creds.env reaches the worker with no compose edit.
+    # creds.env over local.env because AWX_TOKEN is a live credential.
+    #
+    # blockinfile (not copy/lineinfile) so re-running replaces the block in
+    # place rather than appending a second copy — this playbook mints a new
+    # token every run, and stale AWX_TOKEN lines would shadow unpredictably.
+    - name: Put the AWX connection details where the celery worker will see them
+      ansible.builtin.blockinfile:
+        path: "{{ lookup('env', 'HOME') }}/nautobot-docker-compose/environments/creds.env"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK — workshop AWX access"
+        create: true
+        mode: "0600"
+        block: |
+          AWX_HOST=http://host.docker.internal:8013
+          AWX_TOKEN={{ awx_token.ansible_facts.controller_token.token }}
+          AWX_JOB_TEMPLATE=Write back to Nautobot
+      register: awx_env
+
+    # `docker compose restart` is NOT enough — it reuses the existing container,
+    # which keeps the environment it was created with. The containers have to be
+    # recreated, which is what `invoke start` (docker compose up -d) does once
+    # the env file has changed.
+    #
+    # Full path to invoke: this playbook may run from a shell whose PATH does
+    # not include the /opt/ansible venv.
+    - name: Recreate the Nautobot containers so they pick up the new environment
+      ansible.builtin.shell: /opt/ansible/bin/invoke stop && /opt/ansible/bin/invoke start
+      args:
+        chdir: "{{ lookup('env', 'HOME') }}/nautobot-docker-compose"
+      when: awx_env is changed
+      changed_when: true
+
+    # Verify on the WORKER, not the web container. The Job Button runs its
+    # receive_job_button() in celery, so the web container having the variable
+    # proves nothing — and the earlier failure looked exactly like that.
+    #
+    # Container name is {project}-{service}-1; nautobot-docker-compose pins the
+    # project to "nautobot_docker_compose" in tasks.py, so this is stable.
+    - name: Confirm the celery worker can actually see AWX_HOST
+      ansible.builtin.command: docker exec nautobot_docker_compose-celery_worker-1 printenv AWX_HOST
+      register: worker_env
+      changed_when: false
+      failed_when: "'host.docker.internal' not in (worker_env.stdout | default(''))"
+      retries: 12
+      delay: 10
+      until: worker_env is succeeded
+
+    # ------------------------------------------------------------ verification
+    - name: Next step
+      ansible.builtin.debug:
+        msg:
+          - "AWX seeded, including Lab 4's workflow and the Nautobot webhook."
+          - "Sync the project and the Nautobot inventory source, then confirm both hosts appear:"
+          - "  Resources -> Inventories -> Nautobot (Lab 1) -> Hosts"
+          - "Lab 4 end to end: set a device's status to Active in Nautobot and watch"
+          - "  Site Turnup (gated) start on its own under AWX -> Jobs."
+          - "Webhook target: {{ awx_url_from_nautobot }}/api/v2/workflow_job_templates/{{ wfjt.id }}/launch/"

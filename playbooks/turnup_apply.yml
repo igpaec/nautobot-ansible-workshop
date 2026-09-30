@@ -1,0 +1,65 @@
+---
+# Lab 4, node 3 of the `Site Turnup (gated)` workflow — everything after the
+# human said yes.
+#
+# WHAT THIS IS: the only node in the workflow that changes anything. It applies
+# the config that node 1 showed the approver, then writes discovered state back
+# to Nautobot so the change log carries the AWX job ID.
+#
+# 🔴 IT RUNS ONLY IF THE APPROVAL NODE WAS APPROVED. That is not enforced here —
+# it is the workflow's edge from the approval node. If someone denies, or the
+# approval times out, AWX never starts this node and no device is touched.
+#
+# ⚠️ `apply: true` IS SET ON THE AWX JOB TEMPLATE, NOT HERE. diff_intent.yml
+# defaults to check mode, and the job template's extra_vars override that. The
+# same playbook therefore backs both node 1 (preview) and node 3 (apply), which
+# is what guarantees the approver saw the change that actually gets made — two
+# separate playbooks could drift apart, and the drift would be invisible.
+#
+# HOW TO RUN BY HAND:
+#   ansible-playbook -i inventory/nautobot.yml playbooks/turnup_apply.yml -u admin -k -e device_name=leaf1 -e apply=true --limit leaf1
+#
+# Verified against Nautobot 3.2.3 and AWX 24.6.1.
+
+# 🔴 `hosts: all`, NOT `hosts: localhost` — see the long note in turnup_diff.yml.
+# AWX passes `--limit <device>`, which applies to every play, so a localhost
+# play matches nothing and is SKIPPED. Here that would skip the no-op guard
+# below, which is the one thing standing between a lost `apply: true` and a
+# false "approved and applied" entry in the audit trail.
+- name: Announce what was approved
+  hosts: all
+  gather_facts: false
+
+  tasks:
+    - name: Announce
+      run_once: true
+      delegate_to: localhost
+      block:
+        - name: Report
+          ansible.builtin.debug:
+            msg:
+              - "Approved — applying to {{ device_name | default('the workflow limit') }}."
+              - "Mode: {{ 'APPLY (changes will be made)' if (apply | default(false) | bool) else 'CHECK ONLY — apply is not set, nothing will change' }}"
+              - "AWX job: {{ awx_job_id | default('local-run') }}"
+
+        # If this fires, the job template lost its extra_vars and the node would
+        # silently do nothing while reporting success — the worst possible
+        # outcome for an approval gate, because the record would say a change
+        # was applied.
+        - name: Refuse to run as a no-op
+          ansible.builtin.assert:
+            that: apply | default(false) | bool
+            fail_msg: >-
+              apply is not true, so this node would change nothing while still
+              reporting success — which would put a false "approved and applied"
+              entry in the audit trail. Set `apply: true` in the extra_vars of
+              the `Site Turnup - apply and write back` job template.
+
+# Same playbook node 1 used, with apply=true this time.
+- name: Apply the approved configuration
+  ansible.builtin.import_playbook: diff_intent.yml
+
+# Lab 3's playbook, unchanged. It picks up awx_job_id from AWX automatically, so
+# the Nautobot change log entry names the workflow job that made the change.
+- name: Write discovered state back to Nautobot
+  ansible.builtin.import_playbook: write_back.yml
